@@ -10,6 +10,7 @@ from custom_components.integrated_split_system.const import (
     CONF_SENSIBO_CONTROLLER_TYPE,
     DEFAULT_PROFILE_ID,
     DOMAIN,
+    PROFILE_CREATE_NEW,
     SENSIBO_CONTROLLER_AIR,
     SENSIBO_CONTROLLER_SKY,
 )
@@ -71,3 +72,42 @@ async def test_options_flow_updates_profile_and_controller(
     assert state is not None
     assert state.attributes["profile_id"] == new_profile
     assert state.attributes["sensibo_controller_type"] == SENSIBO_CONTROLLER_SKY
+
+
+async def test_options_create_profile_preserves_pending_controller(
+    hass,
+    kitchen_physical_climate: str,
+) -> None:
+    """Create-new-profile subflow must keep the Sensibo type chosen on the options form."""
+    entry = await setup_config_entry(
+        hass,
+        build_config_entry_data(
+            physical_climate_entity_id=kitchen_physical_climate,
+            room_name="Kitchen",
+            sensibo_controller_type=SENSIBO_CONTROLLER_AIR,
+        ),
+        entry_id="options_create_profile",
+    )
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_PROFILE_ID: PROFILE_CREATE_NEW,
+            CONF_SENSIBO_CONTROLLER_TYPE: SENSIBO_CONTROLLER_SKY,
+        },
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "profile"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={"profile_name": "Created From Options", "profile_id": "from_options"},
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()
+
+    reloaded = hass.config_entries.async_get_entry(entry.entry_id)
+    assert reloaded is not None
+    assert reloaded.options[CONF_PROFILE_ID] == "from_options"
+    assert reloaded.options[CONF_SENSIBO_CONTROLLER_TYPE] == SENSIBO_CONTROLLER_SKY

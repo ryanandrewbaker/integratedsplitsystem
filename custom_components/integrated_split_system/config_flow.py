@@ -209,6 +209,9 @@ class IntegratedSplitSystemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class IntegratedSplitSystemOptionsFlow(config_entries.OptionsFlowWithReload):
     """Options flow for per-room settings (auto-reloads entry on save)."""
 
+    def __init__(self) -> None:
+        self._pending_options: dict[str, Any] | None = None
+
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Manage room options."""
         from . import async_setup as domain_setup
@@ -218,6 +221,7 @@ class IntegratedSplitSystemOptionsFlow(config_entries.OptionsFlowWithReload):
         if user_input is not None:
             profile_choice = user_input.get(CONF_PROFILE_ID, DEFAULT_PROFILE_ID)
             if profile_choice == PROFILE_CREATE_NEW:
+                self._pending_options = dict(user_input)
                 return await self.async_step_profile()
 
             store: EquipmentProfileStore = self.hass.data[DOMAIN]["profiles"]
@@ -257,7 +261,12 @@ class IntegratedSplitSystemOptionsFlow(config_entries.OptionsFlowWithReload):
                 errors["profile_id"] = "already_exists"
             else:
                 await store.async_create_profile(profile_id, display_name)
-                controller = get_current_controller(self.config_entry)
+                pending = dict(self._pending_options or {})
+                self._pending_options = None
+                controller = pending.get(
+                    CONF_SENSIBO_CONTROLLER_TYPE,
+                    get_current_controller(self.config_entry),
+                )
                 return self.async_create_entry(
                     data={
                         CONF_PROFILE_ID: profile_id,

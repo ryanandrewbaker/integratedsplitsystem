@@ -13,7 +13,6 @@ from homeassistant.exceptions import ServiceValidationError
 
 from custom_components.integrated_split_system.const import (
     DEFAULT_PROFILE_ID,
-    MINIMUM_TARGET_SEPARATION_C,
     SENSIBO_CONTROLLER_UNKNOWN,
 )
 
@@ -64,7 +63,7 @@ async def test_hvac_mode_virtual_only(hass, kitchen_physical_climate: str) -> No
         )
 
 
-async def test_temperature_band_enforces_minimum_separation(
+async def test_temperature_band_rejects_insufficient_separation(
     hass, kitchen_physical_climate: str
 ) -> None:
     entry = await setup_config_entry(
@@ -77,27 +76,18 @@ async def test_temperature_band_enforces_minimum_separation(
     )
     climate_id = climate_entities_for_entry(hass, entry.entry_id)[0]
 
-    with track_climate_service_calls(hass) as calls:
-        await hass.services.async_call(
-            CLIMATE_DOMAIN,
-            SERVICE_SET_TEMPERATURE,
-            {
-                "entity_id": climate_id,
-                "target_temp_low": 21.0,
-                "target_temp_high": 21.0,
-            },
-            blocking=True,
-        )
-        await hass.async_block_till_done()
-
-    state = hass.states.get(climate_id)
-    assert state is not None
-    low = state.attributes["target_temp_low"]
-    high = state.attributes["target_temp_high"]
-    assert high - low >= MINIMUM_TARGET_SEPARATION_C
-    assert not any(
-        c[2].get("entity_id") == kitchen_physical_climate for c in calls
-    )
+    with pytest.raises(ServiceValidationError):
+        with track_climate_service_calls(hass):
+            await hass.services.async_call(
+                CLIMATE_DOMAIN,
+                SERVICE_SET_TEMPERATURE,
+                {
+                    "entity_id": climate_id,
+                    "target_temp_low": 21.0,
+                    "target_temp_high": 21.0,
+                },
+                blocking=True,
+            )
 
 
 async def test_physical_state_does_not_overwrite_user_targets(

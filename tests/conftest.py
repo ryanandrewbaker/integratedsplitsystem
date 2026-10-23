@@ -164,6 +164,16 @@ def get_runtime_coordinator(hass: HomeAssistant, entry: ConfigEntry) -> Any:
     return coordinator
 
 
+def get_virtual_climate_entity(hass: HomeAssistant, entry_id: str) -> Any:
+    """Return the integration ClimateEntity instance for a config entry."""
+    climate_id = climate_entities_for_entry(hass, entry_id)[0]
+    component = hass.data.get(CLIMATE_DOMAIN)
+    assert component is not None
+    entity = component.get_entity(climate_id)
+    assert entity is not None
+    return entity
+
+
 def climate_entities_for_entry(hass: HomeAssistant, entry_id: str) -> list[str]:
     """List integration-owned climate entity IDs for a config entry."""
     registry = er.async_get(hass)

@@ -30,7 +30,11 @@ from .const import (
 )
 from .coordinator import IntegratedSplitSystemCoordinator
 from .entry_helpers import get_profile_id, get_sensibo_controller_type
-from .util import clamp_temperature_band
+from .util import (
+    TemperatureValidationError,
+    apply_dual_setpoint_update,
+    parse_physical_temperature_celsius,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -99,7 +103,14 @@ class IntegratedSplitSystemClimate(ClimateEntity):
         @callback
         def _physical_changed(event: Any) -> None:
             new_state = event.data.get("new_state")
-            self._sync_readonly_from_physical(new_state)
+            try:
+                self._sync_readonly_from_physical(new_state)
+            except Exception:  # noqa: BLE001 — listener must never crash on bad telemetry
+                _LOGGER.debug(
+                    "Ignoring invalid physical telemetry from %s",
+                    self._physical_entity_id,
+                    exc_info=True,
+                )
             self.async_write_ha_state()
 
         self._unsub_track = async_track_state_change_event(
@@ -115,25 +126,39 @@ class IntegratedSplitSystemClimate(ClimateEntity):
 
     def _sync_readonly_from_physical(self, state: Any) -> None:
         """Mirror read-only telemetry from physical entity; never copy its control surface."""
-        if state is None:
+        if state is None or state.state in (None, "unavailable", "unknown"):
             return
-        current = state.attributes.get("current_temperature")
+
+        current = parse_physical_temperature_celsius(state, "current_temperature")
         if current is not None:
-            self._attr_current_temperature = float(current)
-        min_temp = state.attributes.get("min_temp")
+            self._attr_current_temperature = current
+
+        min_temp = parse_physical_temperature_celsius(state, "min_temp")
         if min_temp is not None:
-            self._attr_min_temp = float(min_temp)
-        max_temp = state.attributes.get("max_temp")
+            self._attr_min_temp = min_temp
+
+        max_temp = parse_physical_temperature_celsius(state, "max_temp")
         if max_temp is not None:
-            self._attr_max_temp = float(max_temp)
+            self._attr_max_temp = max_temp
+
         if not self._targets_initialized:
-            temp = state.attributes.get("temperature")
-            if temp is not None:
-                center = float(temp)
-                self._target_temp_low, self._target_temp_high = clamp_temperature_band(
-                    center - MINIMUM_TARGET_SEPARATION_C / 2,
-                    center + MINIMUM_TARGET_SEPARATION_C / 2,
-                )
+            center = parse_physical_temperature_celsius(state, "temperature")
+            if center is not None:
+                half = MINIMUM_TARGET_SEPARATION_C / 2
+                try:
+                    low, high = apply_dual_setpoint_update(
+                        current_low=center - half,
+                        current_high=center + half,
+                        new_low=center - half,
+                        new_high=center + half,
+                        min_temp=self.min_temp,
+                        max_temp=self.max_temp,
+                        step=self.target_temperature_step or 0.5,
+                    )
+                except TemperatureValidationError:
+                    return
+                self._target_temp_low = low
+                self._target_temp_high = high
                 self._targets_initialized = True
 
     @property
@@ -168,14 +193,34 @@ class IntegratedSplitSystemClimate(ClimateEntity):
         self.async_write_ha_state()
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Update virtual comfort band only; enforce minimum separation."""
-        low = self._target_temp_low
-        high = self._target_temp_high
-        if ATTR_TARGET_TEMP_LOW in kwargs:
-            low = float(kwargs[ATTR_TARGET_TEMP_LOW])
-        if ATTR_TARGET_TEMP_HIGH in kwargs:
-            high = float(kwargs[ATTR_TARGET_TEMP_HIGH])
-        low, high = clamp_temperature_band(low, high)
+        """Update virtual comfort band only; enforce separation, limits, and step."""
+        new_low = kwargs.get(ATTR_TARGET_TEMP_LOW)
+        new_high = kwargs.get(ATTR_TARGET_TEMP_HIGH)
+        step = self.target_temperature_step or 0.5
+        try:
+            low, high = apply_dual_setpoint_update(
+                current_low=self._target_temp_low,
+                current_high=self._target_temp_high,
+                new_low=new_low,
+                new_high=new_high,
+                min_temp=self.min_temp,
+                max_temp=self.max_temp,
+                step=step,
+            )
+        except TemperatureValidationError as err:
+            key = "invalid_temperature"
+            message = str(err)
+            if "out of range" in message or "exceeds" in message or "below" in message:
+                key = "temp_out_of_range"
+            elif "separation" in message:
+                key = "temp_separation_too_small"
+            elif "low higher" in message:
+                key = "low_temp_higher_than_high_temp"
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key=key,
+            ) from err
+
         self._target_temp_low = low
         self._target_temp_high = high
         self._targets_initialized = True
