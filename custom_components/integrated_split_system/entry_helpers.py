@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from homeassistant.config_entries import ConfigEntry
 
 from .const import (
     CONF_PROFILE_ID,
     CONF_SENSIBO_CONTROLLER_TYPE,
+    CONF_STALENESS_SECONDS,
+    CONF_TEMPERATURE_SOURCES,
     DEFAULT_PROFILE_ID,
+    DEFAULT_STALENESS_SECONDS,
     SENSIBO_CONTROLLER_UNKNOWN,
 )
 
@@ -29,3 +34,21 @@ def get_sensibo_controller_type(entry: ConfigEntry) -> str:
     """Effective Sensibo controller metadata for this room entry."""
     value = get_config_value(entry, CONF_SENSIBO_CONTROLLER_TYPE, SENSIBO_CONTROLLER_UNKNOWN)
     return value or SENSIBO_CONTROLLER_UNKNOWN
+
+
+def get_temperature_sources_raw(entry: ConfigEntry) -> list[Any]:
+    """Temperature source configuration list."""
+    if CONF_TEMPERATURE_SOURCES in entry.options:
+        raw = entry.options[CONF_TEMPERATURE_SOURCES]
+    else:
+        raw = entry.data.get(CONF_TEMPERATURE_SOURCES)
+    return list(raw) if isinstance(raw, list) else []
+
+
+def get_staleness_seconds(entry: ConfigEntry) -> int:
+    """Max age for a temperature source reading."""
+    raw = entry.options.get(CONF_STALENESS_SECONDS, entry.data.get(CONF_STALENESS_SECONDS))
+    try:
+        return int(raw) if raw is not None else DEFAULT_STALENESS_SECONDS
+    except (TypeError, ValueError):
+        return DEFAULT_STALENESS_SECONDS
