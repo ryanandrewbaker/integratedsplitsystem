@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from homeassistant.const import UnitOfTemperature
+from homeassistant.core import HomeAssistant
 from homeassistant.util.unit_conversion import TemperatureConverter
 
 from .const import MINIMUM_TARGET_SEPARATION_C
@@ -51,17 +52,20 @@ def parse_finite_temperature(value: Any) -> float | None:
     return parsed
 
 
-def physical_state_temperature_unit(state: Any) -> str:
-    """Infer the unit used by a physical climate state."""
-    if state is None:
-        return UnitOfTemperature.CELSIUS
-    unit = state.attributes.get("temperature_unit")
-    if unit in (UnitOfTemperature.CELSIUS, UnitOfTemperature.FAHRENHEIT):
-        return unit
-    uom = state.attributes.get("unit_of_measurement")
-    if uom in (UnitOfTemperature.CELSIUS, UnitOfTemperature.FAHRENHEIT):
-        return uom
-    return UnitOfTemperature.CELSIUS
+def physical_state_temperature_unit(hass: HomeAssistant, state: Any) -> str:
+    """Infer the unit used by a physical climate state.
+
+    Prefer explicit entity metadata; otherwise use the Home Assistant user unit
+    (physical climate values follow the installation display unit on HA 2026.10).
+    """
+    if state is not None:
+        unit = state.attributes.get("temperature_unit")
+        if unit in (UnitOfTemperature.CELSIUS, UnitOfTemperature.FAHRENHEIT):
+            return unit
+        uom = state.attributes.get("unit_of_measurement")
+        if uom in (UnitOfTemperature.CELSIUS, UnitOfTemperature.FAHRENHEIT):
+            return uom
+    return hass.config.units.temperature_unit
 
 
 def convert_temperature_to_celsius(value: float, source_unit: str) -> float:
@@ -73,14 +77,18 @@ def convert_temperature_to_celsius(value: float, source_unit: str) -> float:
     )
 
 
-def parse_physical_temperature_celsius(state: Any, attribute: str) -> float | None:
+def parse_physical_temperature_celsius(
+    hass: HomeAssistant,
+    state: Any,
+    attribute: str,
+) -> float | None:
     """Parse a physical climate attribute into Celsius when possible."""
     if state is None:
         return None
     raw = parse_finite_temperature(state.attributes.get(attribute))
     if raw is None:
         return None
-    source_unit = physical_state_temperature_unit(state)
+    source_unit = physical_state_temperature_unit(hass, state)
     return convert_temperature_to_celsius(raw, source_unit)
 
 

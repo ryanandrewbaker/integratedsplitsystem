@@ -129,20 +129,22 @@ class IntegratedSplitSystemClimate(ClimateEntity):
         if state is None or state.state in (None, "unavailable", "unknown"):
             return
 
-        current = parse_physical_temperature_celsius(state, "current_temperature")
+        current = parse_physical_temperature_celsius(
+            self.hass, state, "current_temperature"
+        )
         if current is not None:
             self._attr_current_temperature = current
 
-        min_temp = parse_physical_temperature_celsius(state, "min_temp")
+        min_temp = parse_physical_temperature_celsius(self.hass, state, "min_temp")
         if min_temp is not None:
             self._attr_min_temp = min_temp
 
-        max_temp = parse_physical_temperature_celsius(state, "max_temp")
+        max_temp = parse_physical_temperature_celsius(self.hass, state, "max_temp")
         if max_temp is not None:
             self._attr_max_temp = max_temp
 
         if not self._targets_initialized:
-            center = parse_physical_temperature_celsius(state, "temperature")
+            center = parse_physical_temperature_celsius(self.hass, state, "temperature")
             if center is not None:
                 half = MINIMUM_TARGET_SEPARATION_C / 2
                 try:
@@ -176,8 +178,6 @@ class IntegratedSplitSystemClimate(ClimateEntity):
             "profile_id": get_profile_id(self._entry),
             "sensibo_controller_type": get_sensibo_controller_type(self._entry),
             "boost_active": self.coordinator.boost_active,
-            "target_temp_low": self._target_temp_low,
-            "target_temp_high": self._target_temp_high,
             "minimum_target_separation_c": MINIMUM_TARGET_SEPARATION_C,
         }
 
