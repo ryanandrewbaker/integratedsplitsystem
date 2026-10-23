@@ -74,7 +74,7 @@ The replacement must reduce operational complexity, provide a traceable command 
 - Heat/cool range setpoints and minimum separation enforced by backend, including updates from other dashboard cards and automations.
 - Operating modes: Off, Idle, Boost Heat, Maintain Heat, Boost Cool, Maintain Cool, Fan Only, manual Dry.
 - Fan auto/manual control; map requested modes only to advertised physical HVAC/fan options.
-- Boost with 30-minute default, original-state snapshot, extension without compounding, expiry and cancellation.
+- Boost with 30-minute default timer, internal boost flag + expiry (Kitchen model, **D01**); extension without compounding; **no** virtual setpoint mutation.
 - Compressor short-cycle protection, bounded commands, delayed state acknowledgments, stale-intent cancellation and HA restart recovery.
 - Native diagnostics sensors or attributes for operating state, effective temperature, requested/reported fan/mode, source health, command attempt counters, last command and errors.
 - Reuse existing Lit Lovelace card, first with explicit compatibility mode, later bundled and version-pinned in the HACS Integration package.
@@ -94,13 +94,18 @@ The replacement must reduce operational complexity, provide a traceable command 
 
 ### FR-01. Configuration, entity model and ownership (P0)
 
-- An integration config flow must select a **real** underlying `climate` entity, its room label, and optional temperature sources. Exclude the integration's own virtual entities from eligible source list.
+- An integration config flow must select a **real** underlying `climate` entity, its **room label**, optional **temperature sources**, and equipment metadata below. Exclude the integration's own virtual entities from eligible source list.
 - Each physical climate entity may belong to only one active Integrated Split System config entry. Duplicate configuration aborts cleanly without replacing existing entries.
 - Each entry creates a stable, uniquely identified native `ClimateEntity` and an integration-owned virtual device. Do not attach the virtual device to the Sensibo config entry or rely on unsupported cross-entry device registry links.
-- Separate options flow supports changing sources and controller settings without recreating an entry. Changing underlying physical climate source requires explicit reconfiguration, with duplicate checks and safe unload/reload.
+- **Two independent hardware dimensions** (do not conflate):
+  1. **`sensibo_controller_type`** — Sensibo hardware family **`air`**, **`sky`**, or **`unknown`**. Informational and diagnostic; auto-detected from the Sensibo device/integration when possible; operator may override in options.
+  2. **`connected_ac_profile`** — lightweight, **user-defined**, **reusable** equipment preference set (optional label such as make/model for the attached split). Profiles are **not** a manufacturer catalogue and are **not** shipped as universal HACS presets. Multiple rooms may **reference the same profile id** while keeping **independent** config entries, virtual climates, and runtime state.
+- Config flow / options: select **Auto (generic)** profile or an existing profile, or **create** a new named profile. Room-specific items (sensors, targets, physical entity binding) stay on the **config entry**; fan/swing **preferences** and mapping hints live on the **profile** when used.
+- **Operator planning examples (unverified, not built-in presets):** Kitchen → its own profile; Family Room + main bedroom → shared profile; Olivia + Alice → shared Mitsubishi-oriented profile (historical YAML mentioned `strong` fan and specific swing values — fixture input only until live capability export).
+- Separate options flow supports changing sources, profile link, and controller type without recreating an entry unless the physical climate changes (reconfigure flow with duplicate checks).
 - Missing required source entities at startup must raise an appropriate retry/repair condition; never send commands to an unknown target.
 
-**Acceptance:** Configure two distinct mock source climates, find both integration entries under Devices & services, reboot and retain stable entities; duplicate physical binding is rejected.
+**Acceptance:** Configure two distinct mock source climates, find both integration entries under Devices & services, reboot and retain stable entities; duplicate physical binding is rejected. Two entries can share one `connected_ac_profile` id with independent boost/state (§10.21).
 
 ### FR-02. Temperature sourcing (P0)
 
@@ -118,7 +123,7 @@ The replacement must reduce operational complexity, provide a traceable command 
 - Controller operating state derives from measured control temperature, requested range, tolerance/hysteresis, demand and last safe state. Explicitly distinguish Idle, Boost and Maintain in heating/cooling directions.
 - Never let temperature-band logic override a selected Fan Only mode; Dry should likewise own its explicit mode transitions.
 - Preserve user power-off intent across restarts; do not silently re-enable climate on entity availability changes.
-- **Parity question before implementation:** Existing documentation describes Boost as ±2°C while historical actuator sequences can command aggressive physical targets (e.g., 28°C heat / 18°C cool). Capture a behavior table and agree on the intended semantics rather than porting conflicting details silently.
+- Boost semantics are defined in **D01** / `docs/DECISIONS.md` (resolved M0): card ±2°C arc is display-only; backend uses ±1°C control bands and 28/18 physical boost targets without changing virtual setpoints.
 
 ### FR-04. Fan Only, manual/automatic fan (P0)
 
@@ -130,10 +135,15 @@ The replacement must reduce operational complexity, provide a traceable command 
 
 ### FR-05. Boost (P0)
 
-- Clicking Boost starts a 30-minute default cycle, raises heating or lowers cooling demand per agreed semantics, and forces suitable High fan where supported.
-- Store the original setpoints, fan preference and active mode once. Re-click extends/restarts the remaining interval, **without** compounding target changes or overwriting the original snapshot.
-- Cancel, expiry, setpoint change or switching Fan Only restores or transitions from the snapshot deterministically.
-- Remaining time and Boost state appear through integration attributes/entities for the existing card.
+**Canonical model:** Kitchen reference + **D01**. Virtual `target_temp_low` / `target_temp_high` are **not** modified when Boost starts, extends, or ends.
+
+- Start Boost (climate not `off`): set internal **boost active** and **boost expiry** (default 30 minutes); apply ±1°C effective control band on the active direction; when the controller enters `boost`, command physical heat **28°C** / cool **18°C** where applicable; stage **high** fan while manual boost is active (without rewriting the user’s stored fan preference on the virtual climate).
+- Extend: restart the 30-minute expiry; **do not** compound band offsets or re-baseline virtual setpoints.
+- Cancel / expiry: clear boost active + expiry only; **do not** reverse or “restore” virtual setpoints (they were never changed). Controller and actuator reconcile from **current** virtual setpoints and fan preferences.
+- Setpoint change or Fan Only (card): cancel Boost first, then apply the new user intent (B5); new targets are authoritative.
+- Expose `boost_active` and `boost_remaining_seconds` on the virtual climate (M5 card) or equivalent sensors.
+
+**Not in scope for Boost:** persisting a duplicate copy of heat/cool targets for later setpoint restoration; card README “snapshot” language applies to legacy YAML UX intent only, not integration virtual target mutation.
 
 ### FR-06. Dry (P0)
 
@@ -155,10 +165,16 @@ The replacement must reduce operational complexity, provide a traceable command 
 
 ### FR-08. Recovery, configuration storage and removal (P0)
 
-- Persist settings in ConfigEntry/options; persist necessary runtime intent, Boost snapshot/deadline, and compressor timestamps using supported HA persistence mechanisms.
-- On restart, reload controller state and first reconcile *read-only* against physical state. A restart must not blindly overwrite current physical AC settings or force a compressor cycle.
-- Correctly subscribe/unsubscribe state listeners on setup, update, unload and removal. Removal must never unexpectedly switch off the physical AC.
-- Restore Boost only if the deadline has not expired and source/sensor state is valid; otherwise exit safely and report restoration outcome.
+- Persist **user configuration** in ConfigEntry `data` / `options` (sources, thresholds, room label, feature flags).
+- Persist **runtime state** per config entry in a supported `Store` (or equivalent), including at minimum:
+  - `boost_active` (bool)
+  - `boost_expires_at` (absolute **UTC wall-clock** instant when Boost ends; used for countdown display and restart restore — not a monotonic clock value)
+  - Actuator: intent generation counter, last physical command fingerprint, `pending_ack` / pause flags, compressor min-cycle timestamps, deferred min-cycle hold deadline (if active)
+  - Shadow mode flag (migration)
+- **Do not** persist a separate Boost “setpoint snapshot” — virtual targets live on the `ClimateEntity` and are not mutated by Boost (FR-05 / D01).
+- On restart: reload persisted runtime state; **read-only** reconcile against physical state first; do not blindly push physical targets or force a compressor cycle.
+- **Boost after restart:** If `boost_active` and `boost_expires_at` is still in the future and temperature sources are valid, resume manual boost behaviour; if expired or invalid, clear boost flags safely and report outcome.
+- Subscribe/unsubscribe listeners on setup, update, unload; removal must not unexpectedly turn off the physical AC.
 
 ### FR-09. Home Assistant UX and diagnostics (P0)
 
@@ -168,13 +184,14 @@ The replacement must reduce operational complexity, provide a traceable command 
 - Optional diagnostic entities (disabled by default when noisy) may include physical command count, mismatch count, source temperature and controller stage.
 - Use HA logging and repair issues for significant unsupported configuration/device failure, rather than anonymous `system_log.write` strings.
 
-### FR-10. Dashboard card and packaging (P1 after core safety)
+### FR-10. Dashboard card and packaging (required before production migration)
 
-- Keep the existing Lit card design as the canonical frontend. Support new controller entities with minimal or zero dashboard YAML, discovering feature data from climate attributes and native services rather than companion YAML helpers.
-- Initially preserve old card's YAML-backed mode without regression. Add new integration-aware behavior behind feature detection.
-- New repository packages one custom integration under `custom_components/integrated_split_system/` for HACS Integration category. The built JS asset from the existing card repository must be **version-pinned**, tested, and shipped as an integration asset if offering one-click installation.
-- Register/serve JS via supported HA frontend and HTTP APIs where available. Explicitly test Lovelace resource registration and stale/duplicate resource handling before claiming zero manual steps.
-- Separate HACS entry for the current dashboard card remains functional until migration; avoid loading two incompatible copies on a dashboard.
+- Keep the existing Lit card design as the canonical frontend. **New integration installations** use a **native API** documented in `docs/ARCHITECTURE.md` §7: virtual `ClimateEntity` (dual setpoints, HVAC modes, fan modes via standard `climate.*` services), integration-owned `switch`/`sensor`/`button` entities where needed, and `integrated_split_system.*` services for Boost and other actions that do not map cleanly onto climate services.
+- **Do not** register fake `script`, `input_boolean`, `input_select`, or `timer` entities from this integration; those domains are owned by other integrations and are not a supported custom-platform shortcut.
+- **Legacy YAML mode:** When the card targets a legacy package virtual climate (no `integrated_split_system` marker), preserve today's helper/script service calls without regression (`src/services.ts`).
+- **Integration mode (M5):** Update the card in `ryanandrewbaker/two-state-thermostat` to detect `integrated_split_system` on the selected climate entity and call the native contract only. Ship a **version-pinned** JS build; optional bundling under `custom_components/integrated_split_system/frontend/` after install tests.
+- Register/serve JS via supported HA frontend APIs where available; test duplicate Lovelace resource handling.
+- **M5 is mandatory before any production room cutover (M6).** M1–M4 are headless backend milestones; they do not require a working dashboard card.
 
 ## 7. Nonfunctional requirements
 
@@ -191,21 +208,22 @@ The replacement must reduce operational complexity, provide a traceable command 
 1. **Inventory first:** Export and confirm physical and temperature entities for all five rooms. Never infer Olivia's, Alice's or main bedroom configuration from naming patterns.
 2. **Baseline capture:** Record live existing controllers, disabled legacy automations, exact temperature averaging and configured thresholds; capture a read-only snapshot of operational behavior. The previous `Kitchen AC Temperature Control` conflict must stay disabled.
 3. **Shadow stage:** Add new integration bound to a source but with **no physical writes** while old controller remains authoritative. Compare computed actions to observed modes for sufficient real use and fault scenarios.
-4. **Cutover one room at a time:** Back up HA config and current settings; explicitly disable all *old physical writers* for that room, then enable exactly one new physical writer. Verify other rooms remain unaffected.
-5. **Rollback:** Disable the new controller's physical writes before restoring old automation/package control. Do not run both simultaneously. Preserve prior targets and state snapshots.
-6. **Remove legacy YAML only after stable observation:** Migration sign-off includes test of Fan Only, manual fan speed, Boost, Maintain, Dry, Off, restart, delayed physical state, source outage and 30-minute no-chatter stability.
+4. **Card release (M5) before cutover:** Install integration build **and** integration-aware card release; pass every acceptance test in `docs/ARCHITECTURE.md` §7.3. Do not point production dashboards at the new climate entity until M5 is complete.
+5. **Cutover one room at a time:** Back up HA config and current settings; explicitly disable all *old physical writers* for that room, then enable exactly one new physical writer. Verify other rooms remain unaffected.
+6. **Rollback:** Disable the new controller's physical writes before restoring old automation/package control. Do not run both simultaneously. Preserve prior targets and state snapshots.
+7. **Remove legacy YAML only after stable observation:** Migration sign-off includes test of Fan Only, manual fan speed, Boost, Maintain, Dry, Off, restart, delayed physical state, source outage and 30-minute no-chatter stability.
 
 ## 9. Delivery milestones and review gates
 
 | Gate | Work | Required evidence before approval |
 |---|---|---|
 | M0 — PRD and contracts | Agree product, edge cases, modes, source mappings, repository strategy | This PRD reviewed; decisions recorded; no implementation |
-| M1 — HA skeleton | Manifest, config flow, entry setup/unload, unique IDs, device/entity registration, tests | Can add/remove 2 fake rooms; no physical writes |
-| M2 — Read-only controller | Native climate state model; temperature inputs; dual range; shadow mode; capability validation | Golden state table + pure tests + HA event fixtures |
+| M1 — HA skeleton | Manifest, config flow, entry setup/unload, unique IDs, device/entity registration, **profile store**, controller-type capture, tests | Can add/remove 2 fake rooms; profile reuse; no physical writes |
+| M2 — Read-only controller | Native climate state model; temperature inputs; dual range; shadow mode; **capability validation** (entity attrs + optional read-only Sensibo discovery) | Golden state table + EP-* fixture tests; no swing **writes** |
 | M3 — Actuator safety | Serialized command owner; convergence; ack windows; min-cycle; retries; fault handling | Service-call sequence tests, delayed Sensibo fixtures, zero-chatter proof |
-| M4 — Mode parity | Fan Only, manual/auto fan, Boost, Dry, restart/persistence | HA-level tests for every mode transition and error branch |
-| M5 — Frontend packaging | Adapt existing card; pinned JS build; HACS install and resource registration | Install/update test; no duplicate card; old cards unaffected |
-| M6 — One-room pilot | Inventory, backup, shadow run, cutover and rollback verification | Human-authorized live test; command trace and physical confirmation |
+| M4 — Mode parity (headless) | Fan Only, manual/auto fan, Boost, Dry, restart/persistence via integration entities/services | HA-level tests for every mode transition; **no** legacy-helper shim entities |
+| M5 — Card + packaging (**required before M6**) | Card integration mode; pinned JS; full §7.3 acceptance matrix; optional HACS bundle | All AT-* card tests green; legacy YAML dashboards unchanged |
+| M6 — One-room pilot | Inventory, backup, shadow run, cutover and rollback verification (**only after M5**) | Human-authorized live test; command trace and physical confirmation |
 | M7 — Multi-room rollout | Additional verified rooms, documentation, release | Room-by-room approval, never bulk auto-deploy |
 
 **At every gate:** Composer works in a feature branch and opens a draft PR. GPT-6 reviews the diff, tests, HA API compatibility and safety; the user approves the next gate. No automatic merge, release, HA restart or physical climate change.
@@ -218,7 +236,7 @@ The replacement must reduce operational complexity, provide a traceable command 
 4. Fan Only maps correctly when supported; unsupported mode produces a clear error and no unsupported physical command.
 5. Manual High request is not reported as confirmed merely because the physical unit reports Auto.
 6. Switching Fan Only ↔ heat/cool and Dry ↔ heat/cool never causes oscillating physical mode commands.
-7. Boost extension preserves its original snapshot; cancel/expiry/restart restores deterministic targets/fan.
+7. Boost extend restarts expiry without compounding; cancel/expiry clears boost flags only (virtual setpoints unchanged); restart restores boost only if expiry still valid (FR-05/FR-08).
 8. A settled unit receives **zero calls** while monitored for 30 minutes with normal sensor updates.
 9. Inject slow/no physical state acknowledgment; retry remains bounded and ends in unconfirmed state, not a loop.
 10. Inject competing external `climate.turn_off` calls; warn/report, do not retaliate indefinitely.
@@ -226,13 +244,22 @@ The replacement must reduce operational complexity, provide a traceable command 
 12. Uninstall/unload integration without stopping an active physical unit or orphaning active listeners.
 13. Test old frontend card while the new integration is installed and verify no duplicate Lovelace JS resource collision.
 14. Demonstrate rollback to old per-room package with old controller disabled during new operation and vice versa.
+15. With `integrated_split_system` climate selected, every dashboard control in §7.3 invokes the native contract (not `script`/`input_*` helpers).
+16. `integrated_split_system.resume_control` after a pause does not replay superseded physical command intents.
+17. `integrated_split_system.boost_start` / `boost_cancel` with `target.entity_id` on one virtual climate does not change Boost state on a second entry’s climate (multi-room isolation).
+18. Service calls with missing target, wrong domain, or non-integration climate entity fail validation without side effects.
+19. Sensibo **Air** vs **Sky** controller type is stored/displayed per entry; capability validation still follows **live** device advertisement (controller type alone does not enable modes).
+20. Two rooms sharing one `connected_ac_profile` apply the same preference hints but maintain **independent** boost, setpoints, and actuator state.
+21. Profile preference for a fan speed or swing value **not** advertised for the current HVAC mode → clear diagnostic/repair, **zero** physical writes for that intent.
+22. Non-Sensibo physical `climate` entities continue to work using generic `hvac_modes` / `fan_modes` only (no `get_device_capabilities` call).
+23. After HA restart, Boost resumes only when `boost_expires_at` (UTC) is still in the future relative to wall clock.
 
 ## 11. Known risks and open decisions
 
 | ID | Question / risk | Owner / resolution gate |
 |---|---|---|
-| D01 | Exact legacy Boost semantics conflict between frontend docs and aggressive physical commands in Kitchen YAML | Resolve M0 with behavior table |
-| D02 | Supported physical `hvac_modes`/`fan_modes` of each actual Sensibo entity are **unverified** | Live inventory before M4/M6 |
+| D01 | Boost semantics (card arc vs Kitchen backend) | **Resolved M0** — see `DECISIONS.md` D01; FR-05 aligned |
+| D02 | Capability proof + equipment profiles (Sensibo Air/Sky vs connected AC type) | M0 profile model; live export before M6 |
 | D03 | Actual identifiers for Olivia's, Alice's and main bedroom remain unknown | Live inventory before room migration |
 | D04 | Should an external physical change temporarily override controller intent or raise an immediate conflict warning? | Policy decision before M3 |
 | D05 | Where to keep canonical Lit card source long-term: existing repository vs move to this repo? | Decide before M5; no premature duplicate source fork |
@@ -269,5 +296,6 @@ Use HA event subscriptions for source data changes, and an internal coordinator/
 - Home Assistant Config Flows: https://contributors.home-assistant.io/core/integrations/config-flow/
 - Home Assistant runtime data recommendation: https://developers.home-assistant.io/docs/core/integration-quality-scale/rules/runtime-data/
 - HACS custom integration repository requirements: https://www.hacs.xyz/docs/publish/integration/
+- Sensibo capability discovery (read-only): https://www.home-assistant.io/integrations/sensibo/
 
 **PRD approval is the first gate. Do not implement or deploy from this draft before decisions D01–D04 are explicitly reviewed.**
