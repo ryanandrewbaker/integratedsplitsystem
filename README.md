@@ -1,6 +1,6 @@
 # Integrated Split System
 
-**Status: PRD/design only. Not an installable Home Assistant integration.**
+**Status: M1 skeleton integration (virtual climate only; no physical commands).**
 
 An upcoming native Home Assistant custom integration that wraps an existing physical climate entity (initially Sensibo), presents a first-class two-target thermostat entity under Devices & services, and works with the [existing Two State Thermostat dashboard card](https://github.com/ryanandrewbaker/two-state-thermostat).
 
@@ -12,7 +12,9 @@ An upcoming native Home Assistant custom integration that wraps an existing phys
 - [Composer / GPT-6 review gates](docs/REVIEW_PROCESS.md)
 - [Agent implementation rules](AGENTS.md)
 
-There is deliberately **no Python implementation yet**. Architecture uses a **native integration API** and an **M5 card update** (no `script`/`input_*` shims). **M5 is required before any production room migration (M6).** Do not deploy to HA from this repo without explicit approval.
+Milestone **M1** adds an installable `custom_components/integrated_split_system` package (config/options flow, virtual `ClimateEntity`, equipment profiles). **M1 does not send physical climate commands.** See [M1 version pins](docs/M1_VERSIONS.md). Architecture uses a **native integration API** and an **M5 card update** (no `script`/`input_*` shims). **M5 is required before any production room migration (M6).** Do not deploy to production HA from this repo without explicit approval.
+
+**Dev tests:** `pip install -r requirements-dev.txt && pytest tests/`
 
 Proposed repository: `ryanandrewbaker/integratedsplitsystem`.
 

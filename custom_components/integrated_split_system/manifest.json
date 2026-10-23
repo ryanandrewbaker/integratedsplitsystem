@@ -1,0 +1,11 @@
+{
+  "domain": "integrated_split_system",
+  "name": "Integrated Split System",
+  "codeowners": ["@ryanandrewbaker"],
+  "config_flow": true,
+  "documentation": "https://github.com/ryanandrewbaker/integratedsplitsystem",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "version": "0.1.0",
+  "requirements": []
+}

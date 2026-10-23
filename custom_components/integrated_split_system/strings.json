@@ -1,0 +1,33 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Integrated Split System room",
+        "description": "Bind a physical climate entity to a virtual room thermostat.",
+        "data": {
+          "room_name": "Room name",
+          "physical_climate_entity_id": "Physical climate entity",
+          "profile_id": "Connected AC equipment profile",
+          "sensibo_controller_type": "Sensibo controller type"
+        }
+      }
+    },
+    "error": {
+      "physical_climate_invalid": "Select a valid climate entity."
+    },
+    "abort": {
+      "physical_climate_in_use": "That physical climate is already configured for another room."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Integrated Split System options",
+        "data": {
+          "profile_id": "Connected AC equipment profile",
+          "sensibo_controller_type": "Sensibo controller type"
+        }
+      }
+    }
+  }
+}
