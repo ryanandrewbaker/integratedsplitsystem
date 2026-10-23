@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main, m1-ha-skeleton, m0-native-api-card-contract]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: |
+          python --version
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m pip show homeassistant pytest-homeassistant-custom-component
+      - name: Run tests
+        run: python -m pytest tests/ -q

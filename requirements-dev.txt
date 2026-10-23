@@ -1,0 +1,5 @@
+# Pinned for Python 3.14.2+; matches pytest-homeassistant-custom-component 0.13.373 deps.
+pytest-homeassistant-custom-component==0.13.373
+homeassistant==2026.10.2
+pytest==9.0.3
+pytest-asyncio==1.4.0
