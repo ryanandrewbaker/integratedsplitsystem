@@ -168,13 +168,14 @@ The replacement must reduce operational complexity, provide a traceable command 
 - Optional diagnostic entities (disabled by default when noisy) may include physical command count, mismatch count, source temperature and controller stage.
 - Use HA logging and repair issues for significant unsupported configuration/device failure, rather than anonymous `system_log.write` strings.
 
-### FR-10. Dashboard card and packaging (P1 after core safety)
+### FR-10. Dashboard card and packaging (required before production migration)
 
-- Keep the existing Lit card design as the canonical frontend. Support new controller entities with minimal or zero dashboard YAML, discovering feature data from climate attributes and native services rather than companion YAML helpers.
-- Initially preserve old card's YAML-backed mode without regression. Add new integration-aware behavior behind feature detection.
-- New repository packages one custom integration under `custom_components/integrated_split_system/` for HACS Integration category. The built JS asset from the existing card repository must be **version-pinned**, tested, and shipped as an integration asset if offering one-click installation.
-- Register/serve JS via supported HA frontend and HTTP APIs where available. Explicitly test Lovelace resource registration and stale/duplicate resource handling before claiming zero manual steps.
-- Separate HACS entry for the current dashboard card remains functional until migration; avoid loading two incompatible copies on a dashboard.
+- Keep the existing Lit card design as the canonical frontend. **New integration installations** use a **native API** documented in `docs/ARCHITECTURE.md` §7: virtual `ClimateEntity` (dual setpoints, HVAC modes, fan modes via standard `climate.*` services), integration-owned `switch`/`sensor`/`button` entities where needed, and `integrated_split_system.*` services for Boost and other actions that do not map cleanly onto climate services.
+- **Do not** register fake `script`, `input_boolean`, `input_select`, or `timer` entities from this integration; those domains are owned by other integrations and are not a supported custom-platform shortcut.
+- **Legacy YAML mode:** When the card targets a legacy package virtual climate (no `integrated_split_system` marker), preserve today's helper/script service calls without regression (`src/services.ts`).
+- **Integration mode (M5):** Update the card in `ryanandrewbaker/two-state-thermostat` to detect `integrated_split_system` on the selected climate entity and call the native contract only. Ship a **version-pinned** JS build; optional bundling under `custom_components/integrated_split_system/frontend/` after install tests.
+- Register/serve JS via supported HA frontend APIs where available; test duplicate Lovelace resource handling.
+- **M5 is mandatory before any production room cutover (M6).** M1–M4 are headless backend milestones; they do not require a working dashboard card.
 
 ## 7. Nonfunctional requirements
 
@@ -191,9 +192,10 @@ The replacement must reduce operational complexity, provide a traceable command 
 1. **Inventory first:** Export and confirm physical and temperature entities for all five rooms. Never infer Olivia's, Alice's or main bedroom configuration from naming patterns.
 2. **Baseline capture:** Record live existing controllers, disabled legacy automations, exact temperature averaging and configured thresholds; capture a read-only snapshot of operational behavior. The previous `Kitchen AC Temperature Control` conflict must stay disabled.
 3. **Shadow stage:** Add new integration bound to a source but with **no physical writes** while old controller remains authoritative. Compare computed actions to observed modes for sufficient real use and fault scenarios.
-4. **Cutover one room at a time:** Back up HA config and current settings; explicitly disable all *old physical writers* for that room, then enable exactly one new physical writer. Verify other rooms remain unaffected.
-5. **Rollback:** Disable the new controller's physical writes before restoring old automation/package control. Do not run both simultaneously. Preserve prior targets and state snapshots.
-6. **Remove legacy YAML only after stable observation:** Migration sign-off includes test of Fan Only, manual fan speed, Boost, Maintain, Dry, Off, restart, delayed physical state, source outage and 30-minute no-chatter stability.
+4. **Card release (M5) before cutover:** Install integration build **and** integration-aware card release; pass every acceptance test in `docs/ARCHITECTURE.md` §7.3. Do not point production dashboards at the new climate entity until M5 is complete.
+5. **Cutover one room at a time:** Back up HA config and current settings; explicitly disable all *old physical writers* for that room, then enable exactly one new physical writer. Verify other rooms remain unaffected.
+6. **Rollback:** Disable the new controller's physical writes before restoring old automation/package control. Do not run both simultaneously. Preserve prior targets and state snapshots.
+7. **Remove legacy YAML only after stable observation:** Migration sign-off includes test of Fan Only, manual fan speed, Boost, Maintain, Dry, Off, restart, delayed physical state, source outage and 30-minute no-chatter stability.
 
 ## 9. Delivery milestones and review gates
 
@@ -203,9 +205,9 @@ The replacement must reduce operational complexity, provide a traceable command 
 | M1 — HA skeleton | Manifest, config flow, entry setup/unload, unique IDs, device/entity registration, tests | Can add/remove 2 fake rooms; no physical writes |
 | M2 — Read-only controller | Native climate state model; temperature inputs; dual range; shadow mode; capability validation | Golden state table + pure tests + HA event fixtures |
 | M3 — Actuator safety | Serialized command owner; convergence; ack windows; min-cycle; retries; fault handling | Service-call sequence tests, delayed Sensibo fixtures, zero-chatter proof |
-| M4 — Mode parity | Fan Only, manual/auto fan, Boost, Dry, restart/persistence | HA-level tests for every mode transition and error branch |
-| M5 — Frontend packaging | Adapt existing card; pinned JS build; HACS install and resource registration | Install/update test; no duplicate card; old cards unaffected |
-| M6 — One-room pilot | Inventory, backup, shadow run, cutover and rollback verification | Human-authorized live test; command trace and physical confirmation |
+| M4 — Mode parity (headless) | Fan Only, manual/auto fan, Boost, Dry, restart/persistence via integration entities/services | HA-level tests for every mode transition; **no** legacy-helper shim entities |
+| M5 — Card + packaging (**required before M6**) | Card integration mode; pinned JS; full §7.3 acceptance matrix; optional HACS bundle | All AT-* card tests green; legacy YAML dashboards unchanged |
+| M6 — One-room pilot | Inventory, backup, shadow run, cutover and rollback verification (**only after M5**) | Human-authorized live test; command trace and physical confirmation |
 | M7 — Multi-room rollout | Additional verified rooms, documentation, release | Room-by-room approval, never bulk auto-deploy |
 
 **At every gate:** Composer works in a feature branch and opens a draft PR. GPT-6 reviews the diff, tests, HA API compatibility and safety; the user approves the next gate. No automatic merge, release, HA restart or physical climate change.
@@ -226,6 +228,8 @@ The replacement must reduce operational complexity, provide a traceable command 
 12. Uninstall/unload integration without stopping an active physical unit or orphaning active listeners.
 13. Test old frontend card while the new integration is installed and verify no duplicate Lovelace JS resource collision.
 14. Demonstrate rollback to old per-room package with old controller disabled during new operation and vice versa.
+15. With `integrated_split_system` climate selected, every dashboard control in §7.3 invokes the native contract (not `script`/`input_*` helpers).
+16. `integrated_split_system.resume_control` after a pause does not replay superseded physical command intents.
 
 ## 11. Known risks and open decisions
 

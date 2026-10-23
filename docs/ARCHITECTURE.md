@@ -1,6 +1,6 @@
 # Integrated Split System — architecture (M0)
 
-**Status:** M0 design draft — revised per [GPT-6 PR #1 review](https://github.com/ryanandrewbaker/integratedsplitsystem/pull/1#issuecomment-6374685858). No runtime code yet.  
+**Status:** M0 correction — native integration API + M5 card contract ([GPT-6 re-review](https://github.com/ryanandrewbaker/integratedsplitsystem/pull/1#issuecomment-6374685858)). No runtime code yet.  
 **Domain (proposed):** `integrated_split_system`  
 **Behavioural reference (read-only):** [two-state-thermostat](https://github.com/ryanandrewbaker/two-state-thermostat) — `homeassistant/packages/kitchen_auto_climate.yaml`, `homeassistant/lib/kitchen-climate-state-machine.ts`, `homeassistant/lib/kitchen-climate-actuator.ts`, `src/services.ts`, `src/state.ts`
 
@@ -10,7 +10,7 @@ Replace per-room Home Assistant YAML packages (Dual Smart Thermostat virtual ent
 
 - Exposes one native `ClimateEntity` per configured room under **Settings → Devices & services**.
 - Owns control logic, mode state, Boost/Dry/Fan Only semantics, and **serialized** physical `climate.*` service calls to an existing underlying climate entity (initially Sensibo).
-- Preserves the existing `custom:two-state-thermostat` card through a documented attribute/service contract (M5 packaging).
+- Works with `custom:two-state-thermostat` via a **native integration API** (M5 card update); legacy YAML installations keep the existing helper/script contract unchanged.
 
 The Sensibo (or other) integration remains the hardware adapter. This integration never stores vendor credentials.
 
@@ -27,18 +27,18 @@ The Sensibo (or other) integration remains the hardware adapter. This integratio
 | Dry | Separate `switch.*_dry_mode`, not climate HVAC mode | Integration-internal Dry flag + physical `dry` when supported |
 | Safe actuator | `kitchen-climate-actuator.ts` mirrors YAML: intent counter, min-cycle deferral, convergence checks | Python `Actuator` with same invariants; shadow mode for migration |
 | Diagnostics | Debug log prefix, command counters in YAML | Native diagnostics + repair issues |
-| Card | Calls `climate.*` **and** helpers (`script`, `input_boolean`, `input_select`, `switch`) per `src/services.ts` | M4: companion shims + attributes; M5: optional native card services |
+| Card | Legacy: helpers + `climate.*` (`src/services.ts`) | M5: integration mode uses `ClimateEntity` + `integrated_split_system.*` + integration `switch`/`sensor`; **no** fake `script`/`input_*`/`timer` entities |
 
 **Verified from repo (not live HA):** Kitchen and Family Room entity IDs and temperature source definitions in `homeassistant/rooms/kitchen.json` and `family_room.json`. Olivia, Alice, and main bedroom are **blocked** in repo audit (`audit_status: blocked`). Live `hvac_modes` / `fan_modes` for any room are **unverified** until operator export.
 
 ## 3. System context
 
 ```text
-┌─────────────────────────────────────────────────────────────────┐
-│  Lovelace: custom:two-state-thermostat (existing repo, unchanged) │
-│  Reads/writes virtual ClimateEntity + optional legacy attributes │
-└────────────────────────────┬────────────────────────────────────┘
-                             │ HA state / services (climate.*)
+┌──────────────────────────────────────────────────────────────────┐
+│  Lovelace: custom:two-state-thermostat                           │
+│  Legacy mode → YAML helpers/scripts  |  M5 integration mode → §7 │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │ climate.* + integrated_split_system.*
 ┌────────────────────────────▼────────────────────────────────────┐
 │  integrated_split_system (this repo, future)                     │
 │  ┌──────────────┐  ┌─────────────────┐  ┌─────────────────────┐ │
@@ -68,7 +68,11 @@ Matches PRD §12; names are stable contracts for M1+.
 |--------|----------------|
 | `__init__.py` | Config entry setup/unload; `runtime_data` container |
 | `config_flow.py` | User setup: room label, physical climate picker (dedupe), temperature sources, defaults |
-| `climate.py` | `ClimateEntity`: `heat_cool`, targets, modes, fan, attributes for card compatibility |
+| `climate.py` | `ClimateEntity`: dual setpoints, `off`/`heat_cool`/`fan_only`, `fan_mode` (auto + device speeds), integration marker attributes |
+| `switch.py` | Dry mode `SwitchEntity` (integration-owned; not `input_boolean`) |
+| `sensor.py` | Control temperature, operating state, humidity, boost countdown, fan diagnostics |
+| `button.py` | Optional Boost cancel / resume (if not service-only) |
+| `services.yaml` | `boost_start`, `boost_cancel`, `resume_control`, shadow toggles |
 | `controller.py` | Pure/stateful control: bands, Idle/Boost/Maintain, Dry, Fan Only, Boost timer |
 | `temperature.py` | Subscriptions, averaging, staleness, unit normalization |
 | `actuator.py` | Physical intent, min-cycle, convergence, service call batching, shadow mode |
@@ -128,9 +132,15 @@ Port invariants from `kitchen-climate-actuator.ts` and package README:
 - Fan-only / dry paths: do not apply compressor-only deferral where reference exempts non-compressor modes (FR-07, D10).
 - **Shadow mode:** compute intents and log; zero physical `climate.*` calls (migration FR-07).
 
-#### 4.4.1 Acknowledgement vs external conflict
+#### 4.4.1 Acknowledgement, unconfirmed device, and external conflict
 
-See **DECISIONS.md §D04**. Implementation must mirror Kitchen **convergence checks** (`evaluatePhysicalConverged`, 0.1°C) and **reconcile throttle** (25s after `last_apply`) before treating mismatch as an external writer. Integration adds **`external_conflict_paused`** after bounded failed reconciles so a second HA automation cannot cause command storms.
+See **DECISIONS.md §D04**. Three **distinct** outcomes after a physical command:
+
+1. **`pending_ack` / `reconciling`** — waiting or retrying until our **command fingerprint** matches physical state (Kitchen 25s throttle, bounded bursts).
+2. **`unconfirmed_device`** — retries exhausted; physical never matched **our** last fingerprint (slow Sensibo, unsupported fan step, device fault). **Not** an external writer. Stop sending; repair names device/ack failure.
+3. **`external_conflict_paused`** — sustained mismatch where observed physical state is **inconsistent with any recent integration-issued fingerprint** (manual AC UI, second HA automation). Stop sending; repair names conflict.
+
+`integrated_split_system.resume_control` recomputes from **current** physical state + **current** user intent; it must **not** replay superseded queued commands (GPT-6 M3 clarification).
 
 ### 4.5 Boost (canonical backend — not card README alone)
 
@@ -138,7 +148,7 @@ See **DECISIONS.md §D04**. Implementation must mirror Kitchen **convergence che
 
 | Concern | Kitchen / TS behaviour | Integration v1 |
 |---------|------------------------|----------------|
-| Start Boost | Boolean on + 30m timer | Same |
+| Start Boost | Boolean on + 30m timer (YAML) | Internal state + `integrated_split_system.boost_start` / attributes (M4 headless) |
 | Virtual setpoints | Unchanged | Same |
 | Control bands | ±1°C on active direction when boolean on | Port `computeKitchenClimateController` |
 | Physical boost | 28°C heat / 18°C cool when controller `boost` | Port `computePhysicalIntent` |
@@ -146,11 +156,13 @@ See **DECISIONS.md §D04**. Implementation must mirror Kitchen **convergence che
 
 Golden scenarios **B1–B7:** `docs/DECISIONS.md` §D01.
 
-### 4.6 Card compatibility layer (summary)
+### 4.6 Public integration surface (no helper-domain shims)
 
-Attributes on the climate entity are for **discovery** (`two_state_thermostat`, entity ID pointers). The card still invokes **services on those entities** (`src/services.ts`). M4 requires **companion shim entities** (scripts, helpers, sensors) wired to the integration coordinator. Full contract: **§7**.
+Custom integrations **cannot** register `script`, `input_boolean`, `input_select`, or `timer` platforms. This project uses only supported entity platforms (`climate`, `switch`, `sensor`, `button`, …) plus the integration’s own service namespace.
 
-**Target end state (M5+):** Optional card changes to call `integrated_split_system` services directly; shims deprecated after acceptance tests.
+- **M1–M4:** Headless validation of controller + actuator + services/entities; dashboards may use Developer Tools — **no production card requirement**.
+- **M5:** Card **integration mode** implements §7; mandatory before **M6** pilot.
+- **Legacy dashboards:** Unchanged card behaviour when the selected entity lacks `integrated_split_system` (see §7.4).
 
 ## 5. Behavior that must be preserved
 
@@ -163,7 +175,8 @@ Derived from card README, package docs, and reference TypeScript (production YAM
 - Boost: 30-minute timer + boolean (Kitchen); extend restarts timer; cancel clears boolean/timer; setpoint change cancels Boost via card; high fan while Boost active; fan controls locked on card while Boost active (`readOnly: boostActive`).
 - Card boost arc ±2°C is **display-only**; backend parity uses ±1°C bands + 28/18 physical boost (DECISIONS D01).
 - Dry: separate manual cycle; suspends normal heat/cool UI semantics; humidity informational.
-- Fan Only: virtual `fan_only`; does not use `climate.set_fan_mode` from card; cancels Boost when entering fan only.
+- Fan Only: virtual `fan_only` via `climate.set_hvac_mode` (legacy + integration mode).
+- Integration mode fan speeds: `climate.set_fan_mode` on the **virtual** climate (M5 removes legacy card ban for integration targets only).
 - Power off intent preserved across restarts (no silent re-enable).
 
 ### 5.2 Control / actuator (reference implementation)
@@ -187,9 +200,10 @@ Derived from card README, package docs, and reference TypeScript (production YAM
 | Area | Approach | Notes |
 |------|----------|-------|
 | Lifecycle | `ConfigEntry` + `async_setup_entry` / `async_unload_entry` | Store coordinator on `entry.runtime_data` per HA quality scale |
-| Entity | `ClimateEntity` subclass | `HVACMode.HEAT_COOL`, `FAN_ONLY`, `OFF`; feature flags for range targets |
+| Entity | `ClimateEntity`, `SwitchEntity`, `SensorEntity`, `ButtonEntity` | Fan via climate `fan_mode`; Dry via integration switch; diagnostics via sensors |
+| Integration services | `integrated_split_system.boost_start`, `boost_cancel`, `resume_control`, … | `services.yaml`; M5 card + automations |
+| Physical writes | `hass.services.async_call("climate", ...)` on **underlying** entity only | Actuator only; never from frontend to Sensibo |
 | Subscriptions | `async_track_state_change_event` / `entity_component` helpers | Avoid Jinja templates for control temperature |
-| Services | `hass.services.async_call("climate", ...)` on **underlying** entity only | Never from frontend to physical entity |
 | Persistence | ConfigEntry `data` / `options`; `Store` for boost snapshot, deadlines, compressor timestamps | Survive restart without forcing physical writes |
 | Diagnostics | `async_get_config_entry_diagnostics` | Redact tokens; include command stats |
 | Repairs | `RepairsFlow` / `issue_registry` | Missing sources, unsupported modes, conflict detection |
@@ -200,49 +214,98 @@ Derived from card README, package docs, and reference TypeScript (production YAM
 
 **Entity registry:** Use `unique_id` and device registry entries; do not rely on `friendly_name` for logic.
 
-## 7. Dashboard card ↔ integration contract (unchanged card, M4 shims)
+## 7. Dashboard card ↔ integration contract (M5 integration mode)
 
-Derived from `src/two-state-thermostat.ts` handlers and `src/services.ts`. The card **never** calls `climate.set_fan_mode` on the virtual entity (`FORBIDDEN_SERVICES`).
+**Detection (M5 card):** `state_attr(climate, 'integrated_split_system') === true` on the selected entity → **integration mode**. Otherwise → **legacy mode** (today’s `src/services.ts` helper/script calls).
 
-### 7.1 Per-control contract
+**Marker attributes on virtual `ClimateEntity`:**
 
-| UI control | Card handler | Service call(s) | Config / attribute keys | Shim entity (M4) | Acceptance test (M4+) |
-|------------|--------------|-----------------|-------------------------|------------------|------------------------|
-| Power | `_togglePower` | `climate.set_hvac_mode` → `heat_cool` or `off`; if off, `cancelDry` first | `entity` / `climate_entity`, `power_on_mode` | Native `ClimateEntity` | `services.test.ts` power payloads + HA fixture |
-| Heat/cool knobs | `_handleTargetChange` | If Boost active: `script.turn_on` cancel → `climate.set_temperature` (`target_temp_low/high`, `hvac_mode: heat_cool`) | `entity`, `minimum_target_separation`, `target_step` | Native climate enforces min gap | Dial adjustment + gap enforcement test |
-| Boost start / extend | `_handleBoost` | `script.turn_on` → `boost_script_entity` | `boost_script_entity` | `ScriptEntity` → `boost_start` service | Timer + boolean on; no virtual target change |
-| Boost cancel | `_handleBoostCancel` | `script.turn_on` → `boost_cancel_script_entity` | `boost_cancel_script_entity` | `ScriptEntity` → `boost_cancel` | Boolean off, timer cancelled |
-| Fan only toggle | `_toggleFanOnly` | If enabling and Boost on: cancel Boost → `climate.set_hvac_mode` `fan_only` or `power_on_mode` | `entity`, `power_on_mode` | Native climate `fan_only` | No `set_fan_mode` from card |
-| Fan Auto toggle | `_toggleFanAuto` | `input_boolean.turn_on/off` **or** `input_select.select_option` `auto`/`low` | `fan_auto_entity`, `fan_override_entity` | Matching helper entities | Fan auto state sync |
-| Fan speed slider | `_handleFanSelect` | May turn off auto → `input_select.select_option` | `fan_override_entity`, `fan_options` / attribute | `input_select` shim | Manual speed not satisfied by `auto` alone on physical |
-| Dry “Switch mode” | `_handleSwitchMode` | `switch.turn_off` / domain of `dry_entity` | `dry_entity` | `SwitchEntity` shim | Dry off, UI returns to thermostat |
-| Dry start | *(not a card button)* | User/automation turns `dry_entity` **on** | `dry_entity` | Switch + internal dry cycle | Physical `dry` when supported |
-| Power off (with Dry) | `_togglePower` | `cancelDry` + `climate.set_hvac_mode` off | `dry_entity` | Same | |
-| Operating label | `buildCardViewState` | *(read)* `operating_state_entity` state | `operating_state_entity` | `SensorEntity` with Kitchen-compatible strings | States: Boost/Maintain heat/cool, Idle, Off, Dry, Fan |
-| Control temperature | dial display | *(read)* `temperature_entity` | `temperature_entity` | `SensorEntity` computed average | Matches FR-02 |
-| Humidity | dial display | *(read)* `humidity_entity` | `humidity_entity` | Optional sensor | |
-| Boost countdown | dial | *(read)* `boost_timer_entity`, `boost_active_entity` | `boost_timer_entity`, `boost_active_entity` | `timer` + `input_boolean` | `getBoostState`: active if boolean **or** timer active |
-| Effective / recommended fan | fan UI | *(read)* `effective_fan_entity`, `recommended_fan_entity` | attribute pointers | Sensors | Optional for simplified fan UI |
+| Attribute | Purpose |
+|-----------|---------|
+| `integrated_split_system` | `true` — enable integration mode |
+| `integrated_split_system_entry_id` | Config entry id for service `target` |
+| `two_state_thermostat` | `true` — card compatibility / suggestions |
+| `minimum_target_separation`, `target_step`, `power_on_mode`, `fan_options` | Same semantics as legacy card README |
+| `operating_state` | String: `off`, `idle`, `boost_heating`, `maintain_heating`, `boost_cooling`, `maintain_cooling`, `fan`, `dry` |
+| `boost_active`, `boost_remaining_seconds` | Boost UI (replaces timer/boolean reads) |
+| `control_temperature` | Optional inline; else read `sensor.*_control_temperature` |
+| `dry_entity_id`, `humidity_entity_id` | Entity ids for integration-owned helpers on same device |
 
-Climate attributes for discovery (card README + `src/config.ts`): `two_state_thermostat`, `temperature_entity`, `operating_state_entity`, `fan_auto_entity`, `fan_override_entity`, `effective_fan_entity`, `recommended_fan_entity`, `boost_*`, `dry_entity`, `humidity_entity`, `power_on_mode`, `fan_options`, `target_step`, `minimum_target_separation`.
+### 7.1 Integration-owned entities (per config entry)
 
-### 7.2 Transition plan
+| Entity | Platform | Role |
+|--------|----------|------|
+| `climate.<room>_integrated_split_system` | `climate` | Primary UI anchor; dual setpoints; HVAC + fan |
+| `sensor.<room>_iss_control_temperature` | `sensor` | Averaged control temp (FR-02) |
+| `sensor.<room>_iss_operating_state` | `sensor` | Mirror of `operating_state` (for automations) |
+| `sensor.<room>_iss_humidity` | `sensor` | Optional display |
+| `switch.<room>_iss_dry_mode` | `switch` | Manual Dry cycle (replaces `switch.*_dry_mode` YAML) |
+| `sensor.<room>_iss_effective_fan` | `sensor` | Reported vs requested fan (diagnostics) |
+| `sensor.<room>_iss_recommended_fan` | `sensor` | Auto-staging recommendation |
 
-1. **M1–M3:** Headless integration; shims may be stubbed or internal-only tests — **no card parity claim**.
-2. **M4:** Register shims on integration device; point attributes at shim entity IDs; run row-by-row acceptance tests above.
-3. **M5:** Optionally change card to call `integrated_split_system.*` when attribute `integrated_split_system_entry_id` present; keep shims for legacy dashboards.
+Exact entity_id patterns are implementation details; the card reads ids from climate attributes or device registry links.
+
+### 7.2 Integration services
+
+| Service | Purpose |
+|---------|---------|
+| `integrated_split_system.boost_start` | Start or extend 30m Boost (Kitchen semantics, D01) |
+| `integrated_split_system.boost_cancel` | Cancel Boost (boolean/timer equivalent) |
+| `integrated_split_system.resume_control` | Clear `external_conflict_paused`; recompute intent — **no stale replay** |
+| `integrated_split_system.set_shadow_mode` | Migration: compute only, no physical writes |
+
+All services accept `entity_id` (virtual climate) or `entry_id`.
+
+### 7.3 Per-control contract and acceptance tests (integration mode)
+
+Legacy reference handlers: `src/two-state-thermostat.ts`. M5 implements a parallel code path.
+
+| ID | UI control | Integration mode action | Read path | Acceptance test |
+|----|------------|-------------------------|-----------|-----------------|
+| AT-01 | Power on | `climate.set_hvac_mode` → `heat_cool` (or `power_on_mode`) on virtual climate | `climate.hvac_mode` | HA fixture: mode changes; physical writer not called in shadow |
+| AT-02 | Power off | If Dry on: `switch.turn_off` dry → `climate.set_hvac_mode` `off` | climate + dry switch | Dry cleared then climate off |
+| AT-03 | Heat knob | If `boost_active`: `boost_cancel` → `climate.set_temperature` low/high | `target_temp_*` | Min gap enforced; boost cleared |
+| AT-04 | Cool knob | Same as AT-03 | same | same |
+| AT-05 | Boost start | `integrated_split_system.boost_start` | `boost_active`, `boost_remaining_seconds` | Virtual targets unchanged; internal boost on (D01 B1) |
+| AT-06 | Boost extend | `boost_start` again | countdown resets ~30m | D01 B2 |
+| AT-07 | Boost cancel | `boost_cancel` or cancel button entity | `boost_active` false | D01 B3 |
+| AT-08 | Boost countdown display | *(read)* `boost_remaining_seconds` | attribute | Matches timer semantics ±1s |
+| AT-09 | Fan only on | If boost: `boost_cancel` → `climate.set_hvac_mode` `fan_only` | `operating_state` → `fan` | No `set_fan_mode` required for mode |
+| AT-10 | Fan only off | `climate.set_hvac_mode` `heat_cool` (power_on_mode) | state leaves `fan` | |
+| AT-11 | Fan Auto toggle | `climate.set_fan_mode` → `auto` (or off-auto → first manual speed) | `fan_mode` attribute | Virtual climate reflects auto |
+| AT-12 | Fan speed select | `climate.set_fan_mode` → selected speed | `fan_mode` | Manual high ≠ satisfied by physical `auto` alone (actuator) |
+| AT-13 | Dry “Switch mode” off | `switch.turn_off` on `dry_entity_id` | dry switch state | UI returns to thermostat |
+| AT-14 | Dry on | *(not card button)* `switch.turn_on` dry or automation | `operating_state` `dry` | Physical `dry` when supported |
+| AT-15 | Operating label | *(read)* `operating_state` or operating sensor | matches controller | Boost/Maintain/Idle/Off/Dry/Fan strings |
+| AT-16 | Control temp display | climate attr or control sensor | numeric | Matches FR-02 averaging |
+| AT-17 | Humidity display | humidity sensor | optional % | |
+| AT-18 | Fan locked during Boost | UI readOnly | fan controls ignored | Matches legacy `readOnly: boostActive` |
+
+**Test layers:** M4 — HA Python tests for AT-01–AT-07, AT-09–AT-12 via services/entities (headless). M5 — Vitest card tests + HA e2e for full AT-01–AT-18.
+
+### 7.4 Legacy mode (YAML package, unchanged)
+
+When `integrated_split_system` is absent, the card keeps calling `script.turn_on`, `input_boolean.*`, `input_select.*`, and legacy `switch.*` per `src/services.ts`. No regression tests required in this repo beyond documenting the fork.
+
+### 7.5 Milestone gating
+
+| Milestone | Card |
+|-----------|------|
+| M1–M4 | Not required; backend-only |
+| **M5** | **Required** — integration mode + AT-* |
+| M6+ | Production migration **blocked** until M5 merged/released |
 
 ## 8. Architectural risks
 
 | Risk | Impact | Mitigation (design) |
 |------|--------|---------------------|
 | Boost semantics (card arc ±2°C vs backend ±1°C / 28/18) | UX confusion | Documented in D01; optional M5 card arc tweak |
-| Incomplete card contract | Broken dashboard | §7 shims + M4 acceptance matrix |
+| Card/API mismatch | Broken dashboard after cutover | M5 mandatory; no helper shims |
 | Ack vs external conflict | False positives / storms | D04 phase model + Kitchen throttle constants |
 | Unverified Sensibo capabilities per room | Fan Only / Dry / fan speeds fail at runtime | Capability probe at setup; gate features; repair issues |
 | External automations writing same physical entity | Beeping, oscillation, safety | Best-effort conflict detection; operator inventory; shadow mode |
 | Restart mid Boost / mid min-cycle | Duplicate or missing physical commands | Persist deadlines/timestamps; resume deferred actions like reference |
-| Card still expects YAML helpers | Broken UX if attributes missing | Compatibility attribute phase; M5 feature detection in card |
+| Legacy vs integration mode fork | Dual code paths in card | Feature flag `integrated_split_system`; legacy path frozen |
 | Dual HACS packages loading two card JS copies | Frontend conflicts | M5 install tests; keep card repo separate until pinned bundle proven |
 | Olivia / Alice / main bedroom unknown | Wrong entity binding | Block config templates; require export before entries |
 | Over-eager reconciliation | Command storms | Zero-chatter acceptance test (PRD §10) |
@@ -255,16 +318,16 @@ Climate attributes for discovery (card README + `src/config.ts`): `two_state_the
 | M1 | Skeleton: manifest, flows, entity registration, no physical writes |
 | M2 | Read-only controller + temperature + shadow mode |
 | M3 | Actuator safety layer |
-| M4 | Full mode parity (Fan Only, Boost, Dry, persistence) |
-| M5 | Card packaging / resource registration |
-| M6–M7 | Pilot and additional rooms with human approval |
+| M4 | Headless mode parity (entities + services; no card) |
+| M5 | Card integration mode + AT-* tests (**blocks M6**) |
+| M6–M7 | Pilot and rollout (**after M5**) |
 
 ## 10. M0 exit criteria
 
 - [x] PRD reviewed against two-state-thermostat reference
 - [x] Architecture + decisions (incl. Boost golden examples, card contract §7, D04 ack policy)
-- [x] GPT-6 blockers #1–#3 addressed in docs (PR #1 revision)
-- [x] Repository hygiene: single `docs/PRD.md`; default branch `main`
-- [ ] User + GPT-6 re-approval before M1 code
+- [x] GPT-6 Boost + D04 ack policy (PR #1)
+- [x] Native API contract; **no** helper-domain shims; M5 before M6 (this revision)
+- [ ] User + GPT-6 approval before M1 code
 
 **No Python under `custom_components/` until the review gate passes.**

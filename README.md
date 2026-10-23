@@ -12,7 +12,7 @@ An upcoming native Home Assistant custom integration that wraps an existing phys
 - [Composer / GPT-6 review gates](docs/REVIEW_PROCESS.md)
 - [Agent implementation rules](AGENTS.md)
 
-There is deliberately **no Python implementation yet**. The first task is to review and approve the PRD and document open architecture decisions. Do not deploy to HA or change the existing dashboard repository from this project.
+There is deliberately **no Python implementation yet**. Architecture uses a **native integration API** and an **M5 card update** (no `script`/`input_*` shims). **M5 is required before any production room migration (M6).** Do not deploy to HA from this repo without explicit approval.
 
 Proposed repository: `ryanandrewbaker/integratedsplitsystem`.
 
