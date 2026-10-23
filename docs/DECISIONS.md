@@ -12,7 +12,7 @@ Decisions D01–D10 correspond to PRD §11. **D11** records the card/API resolut
 | ID | Topic | Proposed resolution (M0) | Gate to finalize |
 |----|--------|---------------------------|------------------|
 | D01 | Boost semantics | Kitchen backend model (no virtual ±2°C shift) | User approves golden examples |
-| D02 | Physical hvac/fan modes | Probe at setup; gate unsupported modes | Live HA export before M4/M6 |
+| D02 | Capabilities + equipment profiles | Entity attrs + optional read-only Sensibo discovery; user-defined reusable profiles | M1–M2 EP-* tests; live export before M6 |
 | D03 | Unverified rooms | No presets; UI-only config after inventory | Export before each room |
 | D04 | Ack / failure / conflict | `pending_ack` → `unconfirmed_device` vs `external_conflict_paused`; safe `resume_control` | M3 actuator tests |
 | D05 | Card source repo | Canonical TS in `two-state-thermostat`; **M5 integration mode** required before M6 | M5 release |
@@ -34,7 +34,7 @@ Kitchen boolean + 30m timer semantics, ±1°C bands, 28/18 physical boost, card 
 | State | Persist? | Notes |
 |-------|----------|-------|
 | `boost_active` | Yes (`Store`) | Cleared on cancel/expiry |
-| `boost_expires_at` | Yes | Used for countdown and restart restore |
+| `boost_expires_at` | Yes | Absolute **UTC wall-clock** end time (not a monotonic timestamp); compare with `now()` after restart |
 | `target_temp_low` / `target_temp_high` | On `ClimateEntity` only | **Not** copied to a boost snapshot |
 | User fan preference (`fan_mode`, auto vs manual) | On `ClimateEntity` | High fan while boost is **staging**, not a separate saved snapshot |
 | Pre-boost setpoint “restore” on cancel | **No** | Cancel clears boost flags; reconcile from current entity state |
@@ -57,9 +57,62 @@ Golden table **B1–B7** (authoritative):
 
 ---
 
-## D02 — Physical `hvac_modes` / `fan_modes` unverified
+## D02 — Capabilities, Sensibo controller type, and connected AC profiles
 
-At config entry setup, read underlying `hvac_modes`, `fan_modes`, and features. Hide unsupported modes on virtual climate; repair issues for unsupported Dry/Fan Only. No physical calls for unsupported capabilities.
+**Problem:** Each room has a Sensibo controller (**Air** or **Sky**) and a **connected split type** that may be shared across rooms. Capability varies by **device + mode**, not by profile name alone.
+
+### Controller type (`sensibo_controller_type`)
+
+- Values: `air` | `sky` | `unknown`.
+- **Auto-detect** from Sensibo device/registry attributes when the physical entity is Sensibo-backed; operator may override in options (informational/diagnostics).
+- Controller type **does not** by itself enable modes or fan speeds — it is not a substitute for capability discovery.
+
+### Connected AC profile (`connected_ac_profile`)
+
+Lightweight, **user-defined**, **reusable** records stored by the integration (e.g. in a `Store`), **not** a manufacturer catalogue and **not** three household-specific HACS presets.
+
+| Profile field (examples) | Purpose |
+|--------------------------|---------|
+| `profile_id` / display name | Stable reference from multiple config entries |
+| Optional `label` | Operator text (“Mitsubishi kids rooms”, “Daikin upstairs”) |
+| Fan preference hints | e.g. map UI “high” → `strong` when capabilities allow |
+| Swing preference hints | vertical / horizontal values **only if** later supported by actuator |
+| Notes | Free text |
+
+**Household planning examples (unverified, operator-created after install):**
+
+| Profile (example name) | Rooms (intent) | Notes |
+|------------------------|----------------|-------|
+| `kitchen` (dedicated) | Kitchen | Independent equipment |
+| `upstairs` (shared) | Family Room, main bedroom | Shared connected AC type when verified |
+| `mitsubishi-kids` (shared) | Olivia, Alice | Historical YAML cited `strong` fan, swing `rangefull` / `fixedleftright` — **not** live proof |
+
+Multiple config entries may reference the same `profile_id`. Each entry still has its **own** physical binding, virtual climate, boost state, and actuator — profile only shares **preference hints**.
+
+### Capability discovery (what actually permits a command)
+
+1. **Always (any `climate` source):** read `hvac_modes`, `fan_modes`, `supported_features`, temperature limits from the physical entity state/attributes.
+2. **When physical entity is Sensibo and action is available:** optional **read-only** call to [`sensibo.get_device_capabilities`](https://www.home-assistant.io/integrations/sensibo/) per HVAC mode to obtain permitted fan speeds, swing modes, horizontal swing, and target temperatures (values are **case-sensitive**).
+3. **Merge rule:** effective permitted set = intersection of entity attributes and per-mode Sensibo capabilities when present; otherwise entity attributes only.
+4. **Profile rule:** a profile preference may **suggest** a mapping (e.g. prefer `strong` over `high`) but **never** enables a value absent from the permitted set. Unsupported → repair/diagnostic, **zero physical writes** for that intent.
+
+### Swing and airflow
+
+- Any future swing/airflow command goes through the **single serialized actuator** (FR-07), with the same ack/conflict policy (D04).
+- **No swing write commands in M1/M2.** Design and validate read-only discovery and gating first.
+
+### M1/M2 fixture criteria (EP-*)
+
+| ID | Scenario |
+|----|----------|
+| EP-01 | Entry A: Sensibo Air + profile P; Entry B: Sensibo Sky + profile Q — types stored independently |
+| EP-02 | Entries A and B share profile P; boost/setpoints on A do not change B |
+| EP-03 | Profile prefers `strong` fan; capabilities for current mode include `strong` → mapping allowed |
+| EP-04 | Profile prefers `strong`; capabilities omit `strong` → diagnostic, no physical `set_fan_mode` |
+| EP-05 | Generic non-Sensibo climate — no `get_device_capabilities`; generic attrs only |
+| EP-06 | Mock Sensibo capabilities differ per HVAC mode; validation refreshes on mode change |
+
+Live entity IDs and deployed capabilities for all five rooms remain **unverified** until operator export.
 
 ---
 
@@ -197,3 +250,4 @@ Full contract: **ARCHITECTURE.md §7**.
 | 2026-10-24 | D01–D10 | Initial + first GPT-6 revision (merged PR #1) |
 | 2026-10-24 | D11, §7 contract | Native API; drop M4 shims — pending GPT-6 review |
 | 2026-10-24 | FR-05/FR-08, §7.2 services | Boost persistence + entity-targeted service payloads (GPT-6 PR #2 follow-up) |
+| 2026-10-24 | FR-01, D02 | Equipment profiles + Sensibo Air/Sky; capability discovery (GPT-6 PR #2 final amendment) |

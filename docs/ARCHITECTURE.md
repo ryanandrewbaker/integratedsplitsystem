@@ -26,6 +26,7 @@ The Sensibo (or other) integration remains the hardware adapter. This integratio
 | Fan Only | Virtual `fan_only` on virtual climate; actuator maps to physical `fan` / `fan_only` | Virtual `HVACMode.FAN_ONLY` + capability-gated physical mapping |
 | Dry | Separate `switch.*_dry_mode`, not climate HVAC mode | Integration-internal Dry flag + physical `dry` when supported |
 | Safe actuator | `kitchen-climate-actuator.ts` mirrors YAML: intent counter, min-cycle deferral, convergence checks | Python `Actuator` with same invariants; shadow mode for migration |
+| Sensibo Air/Sky + AC type | Not modeled in YAML packages | Per-entry controller type + reusable **connected AC profile** (FR-01 / D02) |
 | Diagnostics | Debug log prefix, command counters in YAML | Native diagnostics + repair issues |
 | Card | Legacy: helpers + `climate.*` (`src/services.ts`) | M5: integration mode uses `ClimateEntity` + `integrated_split_system.*` + integration `switch`/`sensor`; **no** fake `script`/`input_*`/`timer` entities |
 
@@ -77,6 +78,8 @@ Matches PRD §12; names are stable contracts for M1+.
 | `temperature.py` | Subscriptions, averaging, staleness, unit normalization |
 | `actuator.py` | Physical intent, min-cycle, convergence, service call batching, shadow mode |
 | `diagnostics.py` | Redacted diagnostics payload, optional diagnostic entities |
+| `equipment_profile.py` | Load/save user-defined connected AC profiles; preference hints (not capability proof) |
+| `capabilities.py` | Merge physical entity attrs + optional read-only `sensibo.get_device_capabilities` |
 | `const.py` / `strings.json` | Domain constants and UI strings |
 
 ### 4.1 Config entry model
@@ -84,8 +87,37 @@ Matches PRD §12; names are stable contracts for M1+.
 - **One config entry ↔ one physical `climate` entity ↔ one virtual `ClimateEntity`.**
 - Unique ID derived from physical entity registry ID (stable across renames where possible).
 - Integration-owned virtual device (not attached to Sensibo config entry).
-- Options flow mutates sources and tuning without rebinding physical entity unless explicit reconfigure flow runs.
+- Options flow mutates sources, **connected AC profile** link, and **Sensibo controller type** without rebinding physical entity unless explicit reconfigure flow runs.
 - Duplicate physical binding: abort with clear error (FR-01).
+
+#### 4.1.1 Sensibo controller type vs connected AC profile
+
+```text
+Config entry (per room)                    Connected AC profile (reusable, optional)
+├── physical climate entity_id             ├── profile_id + operator label
+├── room label                             ├── fan mapping hints (e.g. high → strong)
+├── temperature sources                    ├── swing preference hints (future actuator)
+├── sensibo_controller_type: air|sky|?     └── notes
+├── connected_ac_profile_id ──────────────► (shared by multiple entries)
+└── runtime: boost, setpoints, actuator    └── does NOT share runtime state
+```
+
+- **Controller type** describes the Sensibo hardware (Air vs Sky). Auto-detect when possible; used in diagnostics and discovery strategy selection.
+- **Profile** describes operator preferences for the **attached indoor/outdoor equipment**. It is **not** evidence that a mode, fan speed, or swing value works — **D02 discovery** is authoritative.
+- **No manufacturer catalogue** in the integration; the three household equipment groups are operator-created profile names, not shipped presets.
+
+#### 4.1.2 Capability validation pipeline (D02)
+
+On setup, on physical entity change, and when HVAC mode changes:
+
+1. Read generic `climate` capabilities from the physical entity.
+2. If integration is Sensibo and `sensibo.get_device_capabilities` is available, fetch per-mode permitted fans/swings/targets (**read-only**).
+3. Apply **connected AC profile** hints only to choose among **already permitted** values.
+4. Expose on virtual climate only supported modes/fans; block actuator intents that would send unsupported values (**zero writes**).
+
+Swing/airflow physical commands are **out of scope for M1/M2**; when added later, they use the same serialized actuator and validation pipeline.
+
+**Fixture tests:** `EP-01`–`EP-06` in `DECISIONS.md` §D02 (M1/M2).
 
 ### 4.2 Controller core
 
@@ -161,7 +193,7 @@ Golden scenarios **B1–B7:** `docs/DECISIONS.md` §D01.
 | Persisted field | Purpose | On cancel / expiry | On restart |
 |-----------------|---------|-------------------|------------|
 | `boost_active` | Manual boost equivalent to Kitchen boolean | Set `false` | Restore `true` only if `boost_expires_at` still valid (D09) |
-| `boost_expires_at` | UTC deadline for countdown / extend | Cleared or ignored when inactive | If past → clear boost |
+| `boost_expires_at` | Absolute **UTC wall-clock** instant (Boost end); countdown = `expires_at − now()` | Cleared when inactive | If `now() ≥ expires_at` → clear boost |
 | `target_temp_low` / `target_temp_high` | User comfort band on `ClimateEntity` | **Unchanged** by Boost | Loaded from entity state; not a separate boost copy |
 | User `fan_mode` / auto preference | Stored on virtual climate | **Unchanged** by Boost; high fan is staging while boost active | Reconcile actuator from current preference |
 | Actuator intent generation, fingerprints, pause flags, min-cycle timestamps | Safety (FR-07) | N/A | Read-only reconcile first |
@@ -287,7 +319,7 @@ data:
 
 | Field | Type | Required | Default | Effect |
 |-------|------|----------|---------|--------|
-| `duration_minutes` | number | no | `30` | Sets `boost_expires_at = now + duration` |
+| `duration_minutes` | number | no | `30` | Sets `boost_expires_at` to **UTC now + duration** (wall-clock instant, persisted for restart) |
 
 **Side effects:** `boost_active = true`; update `boost_remaining_seconds` attribute; apply manual-boost control bands; may stage high fan via actuator (not by mutating stored setpoints).
 
@@ -375,7 +407,8 @@ When `integrated_split_system` is absent, the card keeps calling `script.turn_on
 | Boost semantics (card arc ±2°C vs backend ±1°C / 28/18) | UX confusion | Documented in D01; optional M5 card arc tweak |
 | Card/API mismatch | Broken dashboard after cutover | M5 mandatory; no helper shims |
 | Ack vs external conflict | False positives / storms | D04 phase model + Kitchen throttle constants |
-| Unverified Sensibo capabilities per room | Fan Only / Dry / fan speeds fail at runtime | Capability probe at setup; gate features; repair issues |
+| Unverified Sensibo capabilities per room | Fan Only / Dry / fan speeds fail at runtime | D02 entity + optional Sensibo discovery; profile never overrides proof |
+| Air vs Sky vs attached AC conflation | Wrong fan/swing assumptions | Separate controller type and connected AC profile (FR-01) |
 | External automations writing same physical entity | Beeping, oscillation, safety | Best-effort conflict detection; operator inventory; shadow mode |
 | Restart mid Boost / mid min-cycle | Duplicate or missing physical commands | Persist deadlines/timestamps; resume deferred actions like reference |
 | Legacy vs integration mode fork | Dual code paths in card | Feature flag `integrated_split_system`; legacy path frozen |
@@ -400,7 +433,8 @@ When `integrated_split_system` is absent, the card keeps calling `script.turn_on
 - [x] PRD reviewed against two-state-thermostat reference
 - [x] Architecture + decisions (incl. Boost golden examples, card contract §7, D04 ack policy)
 - [x] GPT-6 Boost + D04 ack policy (PR #1)
-- [x] Native API contract; **no** helper-domain shims; M5 before M6 (this revision)
-- [ ] User + GPT-6 approval before M1 code
+- [x] Native API contract; **no** helper-domain shims; M5 before M6
+- [x] Equipment profiles + Sensibo Air/Sky + D02 capability model (FR-01)
+- [ ] User + GPT-6 final M0 approval before M1 code
 
 **No Python under `custom_components/` until the review gate passes.**

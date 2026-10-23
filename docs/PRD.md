@@ -94,13 +94,18 @@ The replacement must reduce operational complexity, provide a traceable command 
 
 ### FR-01. Configuration, entity model and ownership (P0)
 
-- An integration config flow must select a **real** underlying `climate` entity, its room label, and optional temperature sources. Exclude the integration's own virtual entities from eligible source list.
+- An integration config flow must select a **real** underlying `climate` entity, its **room label**, optional **temperature sources**, and equipment metadata below. Exclude the integration's own virtual entities from eligible source list.
 - Each physical climate entity may belong to only one active Integrated Split System config entry. Duplicate configuration aborts cleanly without replacing existing entries.
 - Each entry creates a stable, uniquely identified native `ClimateEntity` and an integration-owned virtual device. Do not attach the virtual device to the Sensibo config entry or rely on unsupported cross-entry device registry links.
-- Separate options flow supports changing sources and controller settings without recreating an entry. Changing underlying physical climate source requires explicit reconfiguration, with duplicate checks and safe unload/reload.
+- **Two independent hardware dimensions** (do not conflate):
+  1. **`sensibo_controller_type`** — Sensibo hardware family **`air`**, **`sky`**, or **`unknown`**. Informational and diagnostic; auto-detected from the Sensibo device/integration when possible; operator may override in options.
+  2. **`connected_ac_profile`** — lightweight, **user-defined**, **reusable** equipment preference set (optional label such as make/model for the attached split). Profiles are **not** a manufacturer catalogue and are **not** shipped as universal HACS presets. Multiple rooms may **reference the same profile id** while keeping **independent** config entries, virtual climates, and runtime state.
+- Config flow / options: select **Auto (generic)** profile or an existing profile, or **create** a new named profile. Room-specific items (sensors, targets, physical entity binding) stay on the **config entry**; fan/swing **preferences** and mapping hints live on the **profile** when used.
+- **Operator planning examples (unverified, not built-in presets):** Kitchen → its own profile; Family Room + main bedroom → shared profile; Olivia + Alice → shared Mitsubishi-oriented profile (historical YAML mentioned `strong` fan and specific swing values — fixture input only until live capability export).
+- Separate options flow supports changing sources, profile link, and controller type without recreating an entry unless the physical climate changes (reconfigure flow with duplicate checks).
 - Missing required source entities at startup must raise an appropriate retry/repair condition; never send commands to an unknown target.
 
-**Acceptance:** Configure two distinct mock source climates, find both integration entries under Devices & services, reboot and retain stable entities; duplicate physical binding is rejected.
+**Acceptance:** Configure two distinct mock source climates, find both integration entries under Devices & services, reboot and retain stable entities; duplicate physical binding is rejected. Two entries can share one `connected_ac_profile` id with independent boost/state (§10.21).
 
 ### FR-02. Temperature sourcing (P0)
 
@@ -163,7 +168,7 @@ The replacement must reduce operational complexity, provide a traceable command 
 - Persist **user configuration** in ConfigEntry `data` / `options` (sources, thresholds, room label, feature flags).
 - Persist **runtime state** per config entry in a supported `Store` (or equivalent), including at minimum:
   - `boost_active` (bool)
-  - `boost_expires_at` (UTC timestamp; monotonic deadline for countdown)
+  - `boost_expires_at` (absolute **UTC wall-clock** instant when Boost ends; used for countdown display and restart restore — not a monotonic clock value)
   - Actuator: intent generation counter, last physical command fingerprint, `pending_ack` / pause flags, compressor min-cycle timestamps, deferred min-cycle hold deadline (if active)
   - Shadow mode flag (migration)
 - **Do not** persist a separate Boost “setpoint snapshot” — virtual targets live on the `ClimateEntity` and are not mutated by Boost (FR-05 / D01).
@@ -213,8 +218,8 @@ The replacement must reduce operational complexity, provide a traceable command 
 | Gate | Work | Required evidence before approval |
 |---|---|---|
 | M0 — PRD and contracts | Agree product, edge cases, modes, source mappings, repository strategy | This PRD reviewed; decisions recorded; no implementation |
-| M1 — HA skeleton | Manifest, config flow, entry setup/unload, unique IDs, device/entity registration, tests | Can add/remove 2 fake rooms; no physical writes |
-| M2 — Read-only controller | Native climate state model; temperature inputs; dual range; shadow mode; capability validation | Golden state table + pure tests + HA event fixtures |
+| M1 — HA skeleton | Manifest, config flow, entry setup/unload, unique IDs, device/entity registration, **profile store**, controller-type capture, tests | Can add/remove 2 fake rooms; profile reuse; no physical writes |
+| M2 — Read-only controller | Native climate state model; temperature inputs; dual range; shadow mode; **capability validation** (entity attrs + optional read-only Sensibo discovery) | Golden state table + EP-* fixture tests; no swing **writes** |
 | M3 — Actuator safety | Serialized command owner; convergence; ack windows; min-cycle; retries; fault handling | Service-call sequence tests, delayed Sensibo fixtures, zero-chatter proof |
 | M4 — Mode parity (headless) | Fan Only, manual/auto fan, Boost, Dry, restart/persistence via integration entities/services | HA-level tests for every mode transition; **no** legacy-helper shim entities |
 | M5 — Card + packaging (**required before M6**) | Card integration mode; pinned JS; full §7.3 acceptance matrix; optional HACS bundle | All AT-* card tests green; legacy YAML dashboards unchanged |
@@ -243,13 +248,18 @@ The replacement must reduce operational complexity, provide a traceable command 
 16. `integrated_split_system.resume_control` after a pause does not replay superseded physical command intents.
 17. `integrated_split_system.boost_start` / `boost_cancel` with `target.entity_id` on one virtual climate does not change Boost state on a second entry’s climate (multi-room isolation).
 18. Service calls with missing target, wrong domain, or non-integration climate entity fail validation without side effects.
+19. Sensibo **Air** vs **Sky** controller type is stored/displayed per entry; capability validation still follows **live** device advertisement (controller type alone does not enable modes).
+20. Two rooms sharing one `connected_ac_profile` apply the same preference hints but maintain **independent** boost, setpoints, and actuator state.
+21. Profile preference for a fan speed or swing value **not** advertised for the current HVAC mode → clear diagnostic/repair, **zero** physical writes for that intent.
+22. Non-Sensibo physical `climate` entities continue to work using generic `hvac_modes` / `fan_modes` only (no `get_device_capabilities` call).
+23. After HA restart, Boost resumes only when `boost_expires_at` (UTC) is still in the future relative to wall clock.
 
 ## 11. Known risks and open decisions
 
 | ID | Question / risk | Owner / resolution gate |
 |---|---|---|
 | D01 | Boost semantics (card arc vs Kitchen backend) | **Resolved M0** — see `DECISIONS.md` D01; FR-05 aligned |
-| D02 | Supported physical `hvac_modes`/`fan_modes` of each actual Sensibo entity are **unverified** | Live inventory before M4/M6 |
+| D02 | Capability proof + equipment profiles (Sensibo Air/Sky vs connected AC type) | M0 profile model; live export before M6 |
 | D03 | Actual identifiers for Olivia's, Alice's and main bedroom remain unknown | Live inventory before room migration |
 | D04 | Should an external physical change temporarily override controller intent or raise an immediate conflict warning? | Policy decision before M3 |
 | D05 | Where to keep canonical Lit card source long-term: existing repository vs move to this repo? | Decide before M5; no premature duplicate source fork |
@@ -286,5 +296,6 @@ Use HA event subscriptions for source data changes, and an internal coordinator/
 - Home Assistant Config Flows: https://contributors.home-assistant.io/core/integrations/config-flow/
 - Home Assistant runtime data recommendation: https://developers.home-assistant.io/docs/core/integration-quality-scale/rules/runtime-data/
 - HACS custom integration repository requirements: https://www.hacs.xyz/docs/publish/integration/
+- Sensibo capability discovery (read-only): https://www.home-assistant.io/integrations/sensibo/
 
 **PRD approval is the first gate. Do not implement or deploy from this draft before decisions D01–D04 are explicitly reviewed.**
