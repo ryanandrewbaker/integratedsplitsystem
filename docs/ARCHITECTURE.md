@@ -22,7 +22,7 @@ The Sensibo (or other) integration remains the hardware adapter. This integratio
 | Multi-room | One package per room; Kitchen hand-maintained, others generated from `rooms/*.json` | One config entry per physical climate; shared Python modules |
 | Dual setpoint + min gap | Virtual climate + card enforce `minimum_target_separation` (default 2°C) | `ClimateEntity` `TARGET_TEMPERATURE_RANGE` + backend enforcement on all writers |
 | Operating states | Template sensors (`*_auto_operating_state`) derived from controller | Expose via climate attributes and/or diagnostic entities for card discovery |
-| Boost / timer / snapshot | Scripts, `input_boolean`, `timer`, snapshot helpers in YAML | Persist snapshot + deadline in ConfigEntry storage / `Store` |
+| Boost / timer | YAML boolean + timer (no virtual target shift) | Persist `boost_active` + `boost_expires_at` only (FR-08 / D01) |
 | Fan Only | Virtual `fan_only` on virtual climate; actuator maps to physical `fan` / `fan_only` | Virtual `HVACMode.FAN_ONLY` + capability-gated physical mapping |
 | Dry | Separate `switch.*_dry_mode`, not climate HVAC mode | Integration-internal Dry flag + physical `dry` when supported |
 | Safe actuator | `kitchen-climate-actuator.ts` mirrors YAML: intent counter, min-cycle deferral, convergence checks | Python `Actuator` with same invariants; shadow mode for migration |
@@ -156,6 +156,18 @@ See **DECISIONS.md §D04**. Three **distinct** outcomes after a physical command
 
 Golden scenarios **B1–B7:** `docs/DECISIONS.md` §D01.
 
+#### 4.5.1 Persisted Boost and runtime state (FR-05 / FR-08)
+
+| Persisted field | Purpose | On cancel / expiry | On restart |
+|-----------------|---------|-------------------|------------|
+| `boost_active` | Manual boost equivalent to Kitchen boolean | Set `false` | Restore `true` only if `boost_expires_at` still valid (D09) |
+| `boost_expires_at` | UTC deadline for countdown / extend | Cleared or ignored when inactive | If past → clear boost |
+| `target_temp_low` / `target_temp_high` | User comfort band on `ClimateEntity` | **Unchanged** by Boost | Loaded from entity state; not a separate boost copy |
+| User `fan_mode` / auto preference | Stored on virtual climate | **Unchanged** by Boost; high fan is staging while boost active | Reconcile actuator from current preference |
+| Actuator intent generation, fingerprints, pause flags, min-cycle timestamps | Safety (FR-07) | N/A | Read-only reconcile first |
+
+**Explicit non-goals:** No persisted “original setpoint snapshot” for Boost; cancel does not call `climate.set_temperature` to undo Boost.
+
 ### 4.6 Public integration surface (no helper-domain shims)
 
 Custom integrations **cannot** register `script`, `input_boolean`, `input_select`, or `timer` platforms. This project uses only supported entity platforms (`climate`, `switch`, `sensor`, `button`, …) plus the integration’s own service namespace.
@@ -204,7 +216,8 @@ Derived from card README, package docs, and reference TypeScript (production YAM
 | Integration services | `integrated_split_system.boost_start`, `boost_cancel`, `resume_control`, … | `services.yaml`; M5 card + automations |
 | Physical writes | `hass.services.async_call("climate", ...)` on **underlying** entity only | Actuator only; never from frontend to Sensibo |
 | Subscriptions | `async_track_state_change_event` / `entity_component` helpers | Avoid Jinja templates for control temperature |
-| Persistence | ConfigEntry `data` / `options`; `Store` for boost snapshot, deadlines, compressor timestamps | Survive restart without forcing physical writes |
+| Persistence | ConfigEntry `data` / `options`; per-entry `Store` for boost flags, actuator safety state, min-cycle timestamps | No boost setpoint snapshot (FR-08) |
+| Entity services | Register Boost/resume as **entity-targeted** services on virtual climates | HA [entity services](https://developers.home-assistant.io/docs/dev_101_services/) / 2025+ entity-service APIs |
 | Diagnostics | `async_get_config_entry_diagnostics` | Redact tokens; include command stats |
 | Repairs | `RepairsFlow` / `issue_registry` | Missing sources, unsupported modes, conflict detection |
 | Unload | Cancel listeners, drain actuator | Must not turn off physical AC on removal (FR-08) |
@@ -223,7 +236,7 @@ Derived from card README, package docs, and reference TypeScript (production YAM
 | Attribute | Purpose |
 |-----------|---------|
 | `integrated_split_system` | `true` — enable integration mode |
-| `integrated_split_system_entry_id` | Config entry id for service `target` |
+| `integrated_split_system_entry_id` | Diagnostics / UI only — **not** a service target |
 | `two_state_thermostat` | `true` — card compatibility / suggestions |
 | `minimum_target_separation`, `target_step`, `power_on_mode`, `fan_options` | Same semantics as legacy card README |
 | `operating_state` | String: `off`, `idle`, `boost_heating`, `maintain_heating`, `boost_cooling`, `maintain_cooling`, `fan`, `dry` |
@@ -245,16 +258,74 @@ Derived from card README, package docs, and reference TypeScript (production YAM
 
 Exact entity_id patterns are implementation details; the card reads ids from climate attributes or device registry links.
 
-### 7.2 Integration services
+### 7.2 Integration services (entity-targeted contract)
 
-| Service | Purpose |
-|---------|---------|
-| `integrated_split_system.boost_start` | Start or extend 30m Boost (Kitchen semantics, D01) |
-| `integrated_split_system.boost_cancel` | Cancel Boost (boolean/timer equivalent) |
-| `integrated_split_system.resume_control` | Clear `external_conflict_paused`; recompute intent — **no stale replay** |
-| `integrated_split_system.set_shadow_mode` | Migration: compute only, no physical writes |
+Services are registered for the integration domain with **`target.entity` restricted to `climate` entities owned by `integrated_split_system`** (see [dev_101_services](https://developers.home-assistant.io/docs/dev_101_services/) and [entity services API changes](https://developers.home-assistant.io/blog/2025/09/25/entity-services-api-changes/)). Callers must supply a **single virtual climate** in `target`; there is **no** config-entry-level Boost service in v1.
 
-All services accept `entity_id` (virtual climate) or `entry_id`.
+**Validation (all services):**
+
+| Check | On failure |
+|-------|------------|
+| `target.entity_id` present exactly once | `service_validation_error`; no state change |
+| Entity exists and `domain == climate` | Same |
+| Entity `integration == integrated_split_system` | Same |
+| Entity belongs to one config entry coordinator | Same |
+| Optional: climate not `off` for `boost_start` (Kitchen script condition) | Reject or no-op with log (implement one behaviour in M4; test in AT-05) |
+
+#### `integrated_split_system.boost_start`
+
+Start or extend Boost (D01 B1/B2). **Does not** write `target_temp_low` / `target_temp_high`.
+
+```yaml
+# Example (UI / automation)
+action: integrated_split_system.boost_start
+target:
+  entity_id: climate.kitchen_integrated_split_system
+data:
+  duration_minutes: 30   # optional; default 30; extend resets expiry to now + duration
+```
+
+| Field | Type | Required | Default | Effect |
+|-------|------|----------|---------|--------|
+| `duration_minutes` | number | no | `30` | Sets `boost_expires_at = now + duration` |
+
+**Side effects:** `boost_active = true`; update `boost_remaining_seconds` attribute; apply manual-boost control bands; may stage high fan via actuator (not by mutating stored setpoints).
+
+#### `integrated_split_system.boost_cancel`
+
+Cancel Boost (D01 B3). **Does not** restore virtual setpoints.
+
+```yaml
+action: integrated_split_system.boost_cancel
+target:
+  entity_id: climate.kitchen_integrated_split_system
+data: {}
+```
+
+**Side effects:** `boost_active = false`; clear expiry; controller/actuator reconcile from current virtual targets and fan preference.
+
+#### `integrated_split_system.resume_control`
+
+Clear `external_conflict_paused` or operator-cleared `unconfirmed_device` (D04). **Does not** replay superseded command queue.
+
+```yaml
+action: integrated_split_system.resume_control
+target:
+  entity_id: climate.kitchen_integrated_split_system
+data: {}
+```
+
+**Side effects:** increment intent generation; read current physical + user state; compute fresh intent; may resume physical writes if not in shadow mode.
+
+#### `integrated_split_system.set_shadow_mode`
+
+```yaml
+action: integrated_split_system.set_shadow_mode
+target:
+  entity_id: climate.kitchen_integrated_split_system
+data:
+  enabled: true
+```
 
 ### 7.3 Per-control contract and acceptance tests (integration mode)
 
@@ -266,9 +337,11 @@ Legacy reference handlers: `src/two-state-thermostat.ts`. M5 implements a parall
 | AT-02 | Power off | If Dry on: `switch.turn_off` dry → `climate.set_hvac_mode` `off` | climate + dry switch | Dry cleared then climate off |
 | AT-03 | Heat knob | If `boost_active`: `boost_cancel` → `climate.set_temperature` low/high | `target_temp_*` | Min gap enforced; boost cleared |
 | AT-04 | Cool knob | Same as AT-03 | same | same |
-| AT-05 | Boost start | `integrated_split_system.boost_start` | `boost_active`, `boost_remaining_seconds` | Virtual targets unchanged; internal boost on (D01 B1) |
-| AT-06 | Boost extend | `boost_start` again | countdown resets ~30m | D01 B2 |
-| AT-07 | Boost cancel | `boost_cancel` or cancel button entity | `boost_active` false | D01 B3 |
+| AT-05 | Boost start | `boost_start` with `target.entity_id` = virtual climate; optional `duration_minutes: 30` | `boost_active`, `boost_remaining_seconds`; `target_temp_*` unchanged | D01 B1; reject if climate `off` (Kitchen parity) |
+| AT-06 | Boost extend | `boost_start` again on same `entity_id` | expiry reset ~30m; setpoints still unchanged | D01 B2 |
+| AT-07 | Boost cancel | `boost_cancel` with same `entity_id`; `data: {}` | `boost_active` false; setpoints unchanged | D01 B3 |
+| AT-19 | Multi-room isolation | `boost_start` on climate **A** only | climate **B** `boost_active` remains false | Two config entries in one HA instance |
+| AT-20 | Service validation | `boost_start` without target; wrong domain; non-integration climate | hard fail; no boost flags set on any entry | FR §10.18 |
 | AT-08 | Boost countdown display | *(read)* `boost_remaining_seconds` | attribute | Matches timer semantics ±1s |
 | AT-09 | Fan only on | If boost: `boost_cancel` → `climate.set_hvac_mode` `fan_only` | `operating_state` → `fan` | No `set_fan_mode` required for mode |
 | AT-10 | Fan only off | `climate.set_hvac_mode` `heat_cool` (power_on_mode) | state leaves `fan` | |
@@ -281,7 +354,7 @@ Legacy reference handlers: `src/two-state-thermostat.ts`. M5 implements a parall
 | AT-17 | Humidity display | humidity sensor | optional % | |
 | AT-18 | Fan locked during Boost | UI readOnly | fan controls ignored | Matches legacy `readOnly: boostActive` |
 
-**Test layers:** M4 — HA Python tests for AT-01–AT-07, AT-09–AT-12 via services/entities (headless). M5 — Vitest card tests + HA e2e for full AT-01–AT-18.
+**Test layers:** M4 — HA Python tests for AT-01–AT-07, AT-09–AT-12, **AT-19–AT-20** (headless). M5 — Vitest card tests + HA e2e for AT-01–AT-20.
 
 ### 7.4 Legacy mode (YAML package, unchanged)
 

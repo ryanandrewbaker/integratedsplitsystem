@@ -74,7 +74,7 @@ The replacement must reduce operational complexity, provide a traceable command 
 - Heat/cool range setpoints and minimum separation enforced by backend, including updates from other dashboard cards and automations.
 - Operating modes: Off, Idle, Boost Heat, Maintain Heat, Boost Cool, Maintain Cool, Fan Only, manual Dry.
 - Fan auto/manual control; map requested modes only to advertised physical HVAC/fan options.
-- Boost with 30-minute default, original-state snapshot, extension without compounding, expiry and cancellation.
+- Boost with 30-minute default timer, internal boost flag + expiry (Kitchen model, **D01**); extension without compounding; **no** virtual setpoint mutation.
 - Compressor short-cycle protection, bounded commands, delayed state acknowledgments, stale-intent cancellation and HA restart recovery.
 - Native diagnostics sensors or attributes for operating state, effective temperature, requested/reported fan/mode, source health, command attempt counters, last command and errors.
 - Reuse existing Lit Lovelace card, first with explicit compatibility mode, later bundled and version-pinned in the HACS Integration package.
@@ -118,7 +118,7 @@ The replacement must reduce operational complexity, provide a traceable command 
 - Controller operating state derives from measured control temperature, requested range, tolerance/hysteresis, demand and last safe state. Explicitly distinguish Idle, Boost and Maintain in heating/cooling directions.
 - Never let temperature-band logic override a selected Fan Only mode; Dry should likewise own its explicit mode transitions.
 - Preserve user power-off intent across restarts; do not silently re-enable climate on entity availability changes.
-- **Parity question before implementation:** Existing documentation describes Boost as ±2°C while historical actuator sequences can command aggressive physical targets (e.g., 28°C heat / 18°C cool). Capture a behavior table and agree on the intended semantics rather than porting conflicting details silently.
+- Boost semantics are defined in **D01** / `docs/DECISIONS.md` (resolved M0): card ±2°C arc is display-only; backend uses ±1°C control bands and 28/18 physical boost targets without changing virtual setpoints.
 
 ### FR-04. Fan Only, manual/automatic fan (P0)
 
@@ -130,10 +130,15 @@ The replacement must reduce operational complexity, provide a traceable command 
 
 ### FR-05. Boost (P0)
 
-- Clicking Boost starts a 30-minute default cycle, raises heating or lowers cooling demand per agreed semantics, and forces suitable High fan where supported.
-- Store the original setpoints, fan preference and active mode once. Re-click extends/restarts the remaining interval, **without** compounding target changes or overwriting the original snapshot.
-- Cancel, expiry, setpoint change or switching Fan Only restores or transitions from the snapshot deterministically.
-- Remaining time and Boost state appear through integration attributes/entities for the existing card.
+**Canonical model:** Kitchen reference + **D01**. Virtual `target_temp_low` / `target_temp_high` are **not** modified when Boost starts, extends, or ends.
+
+- Start Boost (climate not `off`): set internal **boost active** and **boost expiry** (default 30 minutes); apply ±1°C effective control band on the active direction; when the controller enters `boost`, command physical heat **28°C** / cool **18°C** where applicable; stage **high** fan while manual boost is active (without rewriting the user’s stored fan preference on the virtual climate).
+- Extend: restart the 30-minute expiry; **do not** compound band offsets or re-baseline virtual setpoints.
+- Cancel / expiry: clear boost active + expiry only; **do not** reverse or “restore” virtual setpoints (they were never changed). Controller and actuator reconcile from **current** virtual setpoints and fan preferences.
+- Setpoint change or Fan Only (card): cancel Boost first, then apply the new user intent (B5); new targets are authoritative.
+- Expose `boost_active` and `boost_remaining_seconds` on the virtual climate (M5 card) or equivalent sensors.
+
+**Not in scope for Boost:** persisting a duplicate copy of heat/cool targets for later setpoint restoration; card README “snapshot” language applies to legacy YAML UX intent only, not integration virtual target mutation.
 
 ### FR-06. Dry (P0)
 
@@ -155,10 +160,16 @@ The replacement must reduce operational complexity, provide a traceable command 
 
 ### FR-08. Recovery, configuration storage and removal (P0)
 
-- Persist settings in ConfigEntry/options; persist necessary runtime intent, Boost snapshot/deadline, and compressor timestamps using supported HA persistence mechanisms.
-- On restart, reload controller state and first reconcile *read-only* against physical state. A restart must not blindly overwrite current physical AC settings or force a compressor cycle.
-- Correctly subscribe/unsubscribe state listeners on setup, update, unload and removal. Removal must never unexpectedly switch off the physical AC.
-- Restore Boost only if the deadline has not expired and source/sensor state is valid; otherwise exit safely and report restoration outcome.
+- Persist **user configuration** in ConfigEntry `data` / `options` (sources, thresholds, room label, feature flags).
+- Persist **runtime state** per config entry in a supported `Store` (or equivalent), including at minimum:
+  - `boost_active` (bool)
+  - `boost_expires_at` (UTC timestamp; monotonic deadline for countdown)
+  - Actuator: intent generation counter, last physical command fingerprint, `pending_ack` / pause flags, compressor min-cycle timestamps, deferred min-cycle hold deadline (if active)
+  - Shadow mode flag (migration)
+- **Do not** persist a separate Boost “setpoint snapshot” — virtual targets live on the `ClimateEntity` and are not mutated by Boost (FR-05 / D01).
+- On restart: reload persisted runtime state; **read-only** reconcile against physical state first; do not blindly push physical targets or force a compressor cycle.
+- **Boost after restart:** If `boost_active` and `boost_expires_at` is still in the future and temperature sources are valid, resume manual boost behaviour; if expired or invalid, clear boost flags safely and report outcome.
+- Subscribe/unsubscribe listeners on setup, update, unload; removal must not unexpectedly turn off the physical AC.
 
 ### FR-09. Home Assistant UX and diagnostics (P0)
 
@@ -220,7 +231,7 @@ The replacement must reduce operational complexity, provide a traceable command 
 4. Fan Only maps correctly when supported; unsupported mode produces a clear error and no unsupported physical command.
 5. Manual High request is not reported as confirmed merely because the physical unit reports Auto.
 6. Switching Fan Only ↔ heat/cool and Dry ↔ heat/cool never causes oscillating physical mode commands.
-7. Boost extension preserves its original snapshot; cancel/expiry/restart restores deterministic targets/fan.
+7. Boost extend restarts expiry without compounding; cancel/expiry clears boost flags only (virtual setpoints unchanged); restart restores boost only if expiry still valid (FR-05/FR-08).
 8. A settled unit receives **zero calls** while monitored for 30 minutes with normal sensor updates.
 9. Inject slow/no physical state acknowledgment; retry remains bounded and ends in unconfirmed state, not a loop.
 10. Inject competing external `climate.turn_off` calls; warn/report, do not retaliate indefinitely.
@@ -230,12 +241,14 @@ The replacement must reduce operational complexity, provide a traceable command 
 14. Demonstrate rollback to old per-room package with old controller disabled during new operation and vice versa.
 15. With `integrated_split_system` climate selected, every dashboard control in §7.3 invokes the native contract (not `script`/`input_*` helpers).
 16. `integrated_split_system.resume_control` after a pause does not replay superseded physical command intents.
+17. `integrated_split_system.boost_start` / `boost_cancel` with `target.entity_id` on one virtual climate does not change Boost state on a second entry’s climate (multi-room isolation).
+18. Service calls with missing target, wrong domain, or non-integration climate entity fail validation without side effects.
 
 ## 11. Known risks and open decisions
 
 | ID | Question / risk | Owner / resolution gate |
 |---|---|---|
-| D01 | Exact legacy Boost semantics conflict between frontend docs and aggressive physical commands in Kitchen YAML | Resolve M0 with behavior table |
+| D01 | Boost semantics (card arc vs Kitchen backend) | **Resolved M0** — see `DECISIONS.md` D01; FR-05 aligned |
 | D02 | Supported physical `hvac_modes`/`fan_modes` of each actual Sensibo entity are **unverified** | Live inventory before M4/M6 |
 | D03 | Actual identifiers for Olivia's, Alice's and main bedroom remain unknown | Live inventory before room migration |
 | D04 | Should an external physical change temporarily override controller intent or raise an immediate conflict warning? | Policy decision before M3 |

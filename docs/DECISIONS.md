@@ -27,9 +27,23 @@ Decisions D01–D10 correspond to PRD §11. **D11** records the card/API resolut
 
 ## D01 — Boost semantics (canonical v1 model)
 
-Unchanged from prior M0 revision: Kitchen boolean + 30m timer semantics, ±1°C bands, 28/18 physical boost, card ±2°C arc display-only. See golden table **B1–B7** below.
+Kitchen boolean + 30m timer semantics, ±1°C bands, 28/18 physical boost, card ±2°C arc display-only. **Virtual setpoints are never mutated** for Boost start/extend/cancel/expiry.
 
-**M5 card actions (integration mode):** replace `script.turn_on` with `integrated_split_system.boost_start` / `boost_cancel` (AT-05–AT-07).
+### Persisted state (FR-05 / FR-08 — single contract)
+
+| State | Persist? | Notes |
+|-------|----------|-------|
+| `boost_active` | Yes (`Store`) | Cleared on cancel/expiry |
+| `boost_expires_at` | Yes | Used for countdown and restart restore |
+| `target_temp_low` / `target_temp_high` | On `ClimateEntity` only | **Not** copied to a boost snapshot |
+| User fan preference (`fan_mode`, auto vs manual) | On `ClimateEntity` | High fan while boost is **staging**, not a separate saved snapshot |
+| Pre-boost setpoint “restore” on cancel | **No** | Cancel clears boost flags; reconcile from current entity state |
+
+Legacy card README “snapshot” describes YAML-era UX; Kitchen `kitchen_climate_cancel_boost` only clears boolean + timer — it does **not** write virtual setpoints back.
+
+**M5 services:** `boost_start` / `boost_cancel` with required `target.entity_id` on the virtual climate — §ARCHITECTURE.md §7.2.
+
+Golden table **B1–B7** (authoritative):
 
 | ID | Scenario | User action (integration mode) | Virtual targets | Boost internal | Band (heat example) | Physical when `boost` |
 |----|----------|-------------------------------|-----------------|----------------|---------------------|------------------------|
@@ -182,3 +196,4 @@ Full contract: **ARCHITECTURE.md §7**.
 |------|-----|---------|
 | 2026-10-24 | D01–D10 | Initial + first GPT-6 revision (merged PR #1) |
 | 2026-10-24 | D11, §7 contract | Native API; drop M4 shims — pending GPT-6 review |
+| 2026-10-24 | FR-05/FR-08, §7.2 services | Boost persistence + entity-targeted service payloads (GPT-6 PR #2 follow-up) |
