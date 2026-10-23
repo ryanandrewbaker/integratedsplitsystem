@@ -1,9 +1,9 @@
 # Design decisions — Integrated Split System (M0)
 
-**Status:** Revised per GPT-6 review on PR #1 (24 Oct 2026). Pending re-review.  
-**Behavioural reference:** `ryanandrewbaker/two-state-thermostat` — `homeassistant/packages/kitchen_auto_climate.yaml`, `homeassistant/lib/kitchen-climate-*.ts`, `src/services.ts`, `src/state.ts`, `src/constants.ts`.
+**Status:** Revised per GPT-6 PR #1 re-review (native API; no helper shims). Pending approval.  
+**Behavioural reference:** `ryanandrewbaker/two-state-thermostat` — Kitchen YAML/TS for **control semantics**; **API shape** is integration-native (§ARCHITECTURE.md §7).
 
-Decisions D01–D10 correspond to PRD §11.
+Decisions D01–D10 correspond to PRD §11. **D11** records the card/API resolution from the second GPT-6 review.
 
 ---
 
@@ -11,210 +11,235 @@ Decisions D01–D10 correspond to PRD §11.
 
 | ID | Topic | Proposed resolution (M0) | Gate to finalize |
 |----|--------|---------------------------|------------------|
-| D01 | Boost semantics | **Single canonical backend model** = Kitchen package + TS (no ±2°C virtual setpoint shift); card ±2°C arc is display-only | User approves golden examples |
-| D02 | Physical hvac/fan modes | Probe at setup from underlying entity; hide/disable unsupported features | Live HA export before M4/M6 |
-| D03 | Unverified rooms | No config presets; entries only via UI after operator inventory | Export before each room migration |
-| D04 | External physical writes | **pending_ack** vs **external_conflict_paused** (see §D04); bounded reconcile from Kitchen YAML | M3 actuator tests |
-| D05 | Card source repo | Keep canonical source in `two-state-thermostat` until M5 | M5 packaging |
-| D06 | Auto frontend resource | Attempt in M5; document manual fallback | M5 install tests |
-| D07 | HA/Python minimum | Choose in M1 from operator HA version + CI matrix | M1 |
-| D08 | Room-specific thresholds | Per-room options + baseline capture before cutover | Each M6 room |
-| D09 | Restart policy | Read-only reconcile first; no blind physical overwrite; restore Boost if timer valid | M2/M3 |
-| D10 | Fan without compressor | Use native `fan`/`fan_only` when advertised; exempt from compressor min-cycle per reference | Per-entity capability check M2/M4 |
+| D01 | Boost semantics | Kitchen backend model (no virtual ±2°C shift) | User approves golden examples |
+| D02 | Capabilities + equipment profiles | Entity attrs + optional read-only Sensibo discovery; user-defined reusable profiles | M1–M2 EP-* tests; live export before M6 |
+| D03 | Unverified rooms | No presets; UI-only config after inventory | Export before each room |
+| D04 | Ack / failure / conflict | `pending_ack` → `unconfirmed_device` vs `external_conflict_paused`; safe `resume_control` | M3 actuator tests |
+| D05 | Card source repo | Canonical TS in `two-state-thermostat`; **M5 integration mode** required before M6 | M5 release |
+| D06 | Auto frontend resource | M5 spike + fallback manual resource step | M5 install tests |
+| D07 | HA/Python minimum | Pin in M1 from operator + CI | M1 |
+| D08 | Room-specific thresholds | Per entry options + baseline before cutover | Each M6 room |
+| D09 | Restart policy | Read-only reconcile first; no blind physical overwrite | M2/M3 |
+| D10 | Fan without compressor | Native `fan`/`fan_only` when advertised | M2/M4 per entity |
+| D11 | Card API (no shims) | Native climate + integration services/entities; legacy card path unchanged | M0 doc approval |
 
 ---
 
 ## D01 — Boost semantics (canonical v1 model)
 
-**GPT-6 blocker addressed:** Do not stack card ±2°C virtual setpoint changes on top of Kitchen ±1°C control bands and 28/18 physical boost targets.
+Kitchen boolean + 30m timer semantics, ±1°C bands, 28/18 physical boost, card ±2°C arc display-only. **Virtual setpoints are never mutated** for Boost start/extend/cancel/expiry.
 
-### What the reference system actually does
+### Persisted state (FR-05 / FR-08 — single contract)
 
-| Layer | Observed behaviour (Kitchen package + card TS) | Source |
-|-------|--------------------------------------------------|--------|
-| Boost start script | If virtual climate not `off`: `input_boolean.kitchen_climate_boost` **on** + `timer.kitchen_climate_boost` **30:00** | `script.kitchen_climate_boost` |
-| Virtual heat/cool targets | **Unchanged** on `climate.kitchen_auto_climate` during Boost | Package + card `set_temperature` only on user dial edits |
-| Manual boost flag | Drives `manual_boost` in controller + actuator (`input_boolean.kitchen_climate_boost`) | Actuator variables |
-| Control band adjustment | When `manual_boost` and direction **heat**: effective low = `base_low + 1.0`; when **cool**: effective high = `base_high - 1.0` | YAML templates, `computeKitchenClimateController` |
-| Effective target sensors | Same ±1°C on active direction for display helpers | `sensor.kitchen_effective_*_target` templates |
-| Physical boost targets | When `controller_state == boost`: heat → **28°C**, cool → **18°C** | `computePhysicalIntent`, `kitchen_actuator_apply` |
-| Physical maintain targets | heat → `min(low + 1, 30)`, cool → `max(high - 1, 10)` with boosted `low`/`high` | Same |
-| Cancel / expiry | `kitchen_climate_cancel_boost` and boost lifecycle: timer cancel + boolean **off** — **no** separate snapshot helpers in Kitchen YAML | Scripts + `kitchen_auto_climate_boost_lifecycle` |
-| Card dial arc | **±2°C** overlay only (`DEFAULT_BOOST_TEMPERATURE_OFFSET = 2` in `getBoostArcOverlay`) | `src/constants.ts`, `src/state.ts` — **does not** change climate attributes |
-| Card README “±2°C / snapshot” | Documents UX intent; Kitchen YAML does **not** shift virtual setpoints ±2°C or restore a multi-field snapshot on cancel | Treat README as **card UX spec**; backend parity = package |
+| State | Persist? | Notes |
+|-------|----------|-------|
+| `boost_active` | Yes (`Store`) | Cleared on cancel/expiry |
+| `boost_expires_at` | Yes | Absolute **UTC wall-clock** end time (not a monotonic timestamp); compare with `now()` after restart |
+| `target_temp_low` / `target_temp_high` | On `ClimateEntity` only | **Not** copied to a boost snapshot |
+| User fan preference (`fan_mode`, auto vs manual) | On `ClimateEntity` | High fan while boost is **staging**, not a separate saved snapshot |
+| Pre-boost setpoint “restore” on cancel | **No** | Cancel clears boost flags; reconcile from current entity state |
 
-**Canonical v1 integration model (proposed):** Port the **Kitchen backend** exactly: boolean + timer, ±1°C band narrowing when manual boost active, state machine + 28/18 physical boost, high fan staging while manual boost and boost/maintain. Do **not** mutate virtual `target_temp_low`/`target_temp_high` when Boost starts.
+Legacy card README “snapshot” describes YAML-era UX; Kitchen `kitchen_climate_cancel_boost` only clears boolean + timer — it does **not** write virtual setpoints back.
 
-**Intentional non-parity (documented):** Card boost arc uses **2°C**; backend effective targets use **1°C**. Keeping the unchanged card is acceptable for M4; aligning arc to 1°C is an optional **M5 card** change, not an integration change.
+**M5 services:** `boost_start` / `boost_cancel` with required `target.entity_id` on the virtual climate — §ARCHITECTURE.md §7.2.
 
-### Golden Boost examples (Kitchen reference, targets 20.0 / 24.5 °C heat/cool)
+Golden table **B1–B7** (authoritative):
 
-Assumptions: climate on `heat_cool`, direction **heat**, control temp drives controller state, fan automatic unless noted.
-
-| ID | Scenario | User action | Virtual targets | `manual_boost` | Band used (heat) | Controller → physical (when applicable) |
-|----|----------|-------------|-----------------|----------------|------------------|----------------------------------------|
-| B1 | Start Boost (idle/maintain) | Card → `script.turn_on` boost | 20.0 / 24.5 unchanged | on, timer 30m | low **21.0** (20+1) | If state → `boost`: physical heat **28°C** + high fan |
-| B2 | Extend Boost | Card → boost again (timer restart) | unchanged | stays on, timer reset | unchanged | No compounding: boolean was already on; timer only restarts |
-| B3 | Cancel Boost | Card → cancel script | unchanged | off, timer cancelled | low **20.0** | Reconcile toward maintain/idle intent; no “undo math” on targets |
-| B4 | Timer expiry | Timer finished → lifecycle | unchanged | off | back to base | Same as B3 |
-| B5 | Setpoint edit while Boost | Card → `cancelBoost` then `climate.set_temperature` | user new values | off after cancel | per new targets | Card already cancels Boost first (`two-state-thermostat.ts`) |
-| B6 | Boost while cooling | Boost on, direction **cool** | unchanged | on | high **23.5** (24.5−1) | If `boost` cool: physical **18°C** |
-| B7 | HA restart | Timer `restore: true` | unchanged | lifecycle clears boolean if timer not active | — | On startup: do not force physical 28/18 until controller evaluates (see D09) |
-
-**User approval:** Confirm canonical v1 = Kitchen backend (not card README ±2°C virtual shift).
+| ID | Scenario | User action (integration mode) | Virtual targets | Boost internal | Band (heat example) | Physical when `boost` |
+|----|----------|-------------------------------|-----------------|----------------|---------------------|------------------------|
+| B1 | Start Boost | `boost_start` | 20.0 / 24.5 unchanged | active, 30m | low **21.0** | heat **28°C** |
+| B2 | Extend | `boost_start` again | unchanged | timer reset | unchanged | no compounding |
+| B3 | Cancel | `boost_cancel` | unchanged | off | low **20.0** | reconcile |
+| B4 | Expiry | internal timer | unchanged | off | base | reconcile |
+| B5 | Setpoint edit | `boost_cancel` + `climate.set_temperature` | user values | off | per targets | card order preserved |
+| B6 | Cool boost | `boost_start` | unchanged | active | high **23.5** | cool **18°C** |
+| B7 | HA restart | — | unchanged | restore if timer valid (D09) | — | no blind 28/18 push |
 
 ---
 
-## D02 — Physical `hvac_modes` / `fan_modes` unverified
+## D02 — Capabilities, Sensibo controller type, and connected AC profiles
 
-**Proposed resolution:** At config entry setup and on underlying entity capability changes, read `hvac_modes`, `fan_modes`, and supported features from the physical entity. Cache on coordinator. If `dry`, `fan`, or `fan_only` is absent, set feature flags off on virtual entity and raise repair issue “mode not supported by device.” Do not send unsupported service calls.
+**Problem:** Each room has a Sensibo controller (**Air** or **Sky**) and a **connected split type** that may be shared across rooms. Capability varies by **device + mode**, not by profile name alone.
 
-**Owner action:** Run `export-climate-audit.sh` (card repo) per room before M4 and M6.
+### Controller type (`sensibo_controller_type`)
+
+- Values: `air` | `sky` | `unknown`.
+- **Auto-detect** from Sensibo device/registry attributes when the physical entity is Sensibo-backed; operator may override in options (informational/diagnostics).
+- Controller type **does not** by itself enable modes or fan speeds — it is not a substitute for capability discovery.
+
+### Connected AC profile (`connected_ac_profile`)
+
+Lightweight, **user-defined**, **reusable** records stored by the integration (e.g. in a `Store`), **not** a manufacturer catalogue and **not** three household-specific HACS presets.
+
+| Profile field (examples) | Purpose |
+|--------------------------|---------|
+| `profile_id` / display name | Stable reference from multiple config entries |
+| Optional `label` | Operator text (“Mitsubishi kids rooms”, “Daikin upstairs”) |
+| Fan preference hints | e.g. map UI “high” → `strong` when capabilities allow |
+| Swing preference hints | vertical / horizontal values **only if** later supported by actuator |
+| Notes | Free text |
+
+**Household planning examples (unverified, operator-created after install):**
+
+| Profile (example name) | Rooms (intent) | Notes |
+|------------------------|----------------|-------|
+| `kitchen` (dedicated) | Kitchen | Independent equipment |
+| `upstairs` (shared) | Family Room, main bedroom | Shared connected AC type when verified |
+| `mitsubishi-kids` (shared) | Olivia, Alice | Historical YAML cited `strong` fan, swing `rangefull` / `fixedleftright` — **not** live proof |
+
+Multiple config entries may reference the same `profile_id`. Each entry still has its **own** physical binding, virtual climate, boost state, and actuator — profile only shares **preference hints**.
+
+### Capability discovery (what actually permits a command)
+
+1. **Always (any `climate` source):** read `hvac_modes`, `fan_modes`, `supported_features`, temperature limits from the physical entity state/attributes.
+2. **When physical entity is Sensibo and action is available:** optional **read-only** call to [`sensibo.get_device_capabilities`](https://www.home-assistant.io/integrations/sensibo/) per HVAC mode to obtain permitted fan speeds, swing modes, horizontal swing, and target temperatures (values are **case-sensitive**).
+3. **Merge rule:** effective permitted set = intersection of entity attributes and per-mode Sensibo capabilities when present; otherwise entity attributes only.
+4. **Profile rule:** a profile preference may **suggest** a mapping (e.g. prefer `strong` over `high`) but **never** enables a value absent from the permitted set. Unsupported → repair/diagnostic, **zero physical writes** for that intent.
+
+### Swing and airflow
+
+- Any future swing/airflow command goes through the **single serialized actuator** (FR-07), with the same ack/conflict policy (D04).
+- **No swing write commands in M1/M2.** Design and validate read-only discovery and gating first.
+
+### M1/M2 fixture criteria (EP-*)
+
+| ID | Scenario |
+|----|----------|
+| EP-01 | Entry A: Sensibo Air + profile P; Entry B: Sensibo Sky + profile Q — types stored independently |
+| EP-02 | Entries A and B share profile P; boost/setpoints on A do not change B |
+| EP-03 | Profile prefers `strong` fan; capabilities for current mode include `strong` → mapping allowed |
+| EP-04 | Profile prefers `strong`; capabilities omit `strong` → diagnostic, no physical `set_fan_mode` |
+| EP-05 | Generic non-Sensibo climate — no `get_device_capabilities`; generic attrs only |
+| EP-06 | Mock Sensibo capabilities differ per HVAC mode; validation refreshes on mode change |
+
+Live entity IDs and deployed capabilities for all five rooms remain **unverified** until operator export.
 
 ---
 
 ## D03 — Olivia, Alice, main bedroom entity IDs unknown
 
-**Proposed resolution:** No bundled room templates in integration. Config flow only allows user-selected entities. Document blocked status from card repo `rooms/olivia.json`, `alice.json`, `main_bedroom.json` (`audit_status: blocked`). Migration checklist requires registry export before creating entries.
+No bundled room templates. Config flow only after operator registry export (`rooms/*.json` `audit_status: blocked`).
 
 ---
 
-## D04 — Physical acknowledgement delay vs external conflict
+## D04 — Acknowledgement, unconfirmed device, and external conflict
 
-**GPT-6 blocker addressed:** Slow Sensibo updates are not competing writers. Policy must separate **pending acknowledgement** from **external conflict**.
+### Reference (Kitchen)
 
-### Reference behaviour (Kitchen actuator)
+Convergence checks, 25s reconcile throttle, 60s/90s mismatch triggers — see prior M0 text and `kitchen_auto_climate.yaml` actuator automation.
 
-- Each apply run compares desired vs actual mode, target (±0.1°C), and fan (`evaluateFanConfirmation` / YAML equivalent). If not converged, issues minimal `climate.*` calls once per run.
-- `input_number.kitchen_actuator_intent` increments; stale script runs exit when `run_intent != current intent`.
-- Mismatch automations re-trigger apply after **60s** (active heat/cool) or **90s** (idle/fan/dry expected off) sustained divergence.
-- Reconcile path **throttles** if `kitchen_ac_last_apply` was **&lt; 25s** ago (`stop=reconcile_throttled` — physical may still be converging).
+### Actuator phases (integration)
 
-### Integration actuator phases (proposed)
+| Phase | Meaning | Physical writes | Diagnostic / repair |
+|-------|---------|-----------------|---------------------|
+| `converged` | Matches our fingerprint | None | — |
+| `pending_ack` | Within **25s** after our command | None extra | `syncing` optional |
+| `reconciling` | Post-grace bounded retries (max **3** bursts, 25s apart) | Minimal necessary | `reconcile_attempts` |
+| `unconfirmed_device` | Retries exhausted; physical ≠ **our** last fingerprint | **Stopped** | Repair: slow/unsupported device — **not** external writer |
+| `external_conflict_paused` | Sustained mismatch **incompatible** with our command history (manual AC, second automation) | **Stopped** | Repair: competing control |
 
-| Phase | Meaning | Physical writes | User-visible |
-|-------|---------|-----------------|--------------|
-| `converged` | Desired matches reported within tolerance | None | Normal |
-| `pending_ack` | We issued a command; waiting for physical state | None additional until grace elapses | Optional “syncing” diagnostic |
-| `reconciling` | Not converged after grace; bounded apply retries | At most one apply burst per throttle window | Diagnostics show attempt count |
-| `unconfirmed` | Fan/target still wrong after max attempts per intent | **Stop** retrying this intent | Repair: fan not confirmed |
-| `external_conflict_paused` | Sustained mismatch **not** explained by our last command + grace; pattern consistent with second writer or manual AC UI | **Paused** until cleared | Repair issue + log |
+### Distinguishing `unconfirmed_device` vs `external_conflict_paused`
 
-### Rules
+| Signal | `unconfirmed_device` | `external_conflict_paused` |
+|--------|----------------------|----------------------------|
+| Typical cause | Sensibo lag, fan step unsupported, partial ack | Sensibo app edit, alien `climate.set_*` automation |
+| Fingerprint | Physical state **near** expected (mode right, fan/temp wrong) or stuck after **our** command | Physical state **far** from any recent integration command or **oscillates** between two patterns |
+| After max retries | Stop; show last **requested** vs **observed** | Stop; flag conflict; require operator action |
+| GPT-6 note | Late ACK failure ≠ proof of second writer | Requires evidence inconsistent with our issued commands |
 
-1. **ACK grace window:** After any physical service call, enter `pending_ack` for **`ACK_GRACE_SECONDS = 25`** (match Kitchen reconcile throttle). Physical changes in this window **do not** set external conflict.
-2. **Convergence tolerance:** Mode match rules + **0.1°C** target + fan rules from `kitchen-climate-yaml-templates.ts` (manual high ≠ satisfied by `auto` alone).
-3. **Bounded reconcile:** While not converged and not paused, retry at most **`MAX_RECONCILE_BURST = 3`** apply cycles per mismatch episode, respecting 25s throttle (extends Kitchen counter `kitchen_ac_reconcile_attempts` concept).
-4. **External conflict detection:** If mismatch persists **> 60s** (active) or **> 90s** (idle path) **and** grace/reconcile bursts exhausted **and** observed physical state does not match last **integration-issued** command fingerprint → `external_conflict_paused`. Do not issue further physical commands (prevents Kitchen-style beeping wars).
-5. **Legitimate manual override:** User changes AC from Sensibo app/remote → treated as external conflict once sustained; virtual climate and card keep showing **requested** state; diagnostics show observed vs requested.
-6. **While paused:** Virtual controller continues to compute demand for UI; **no** physical heat/cool/fan/dry commands until user **Resume control** (options/service) after resolving competing automation or accepting observed state.
-7. **Competing HA writer:** Same as manual override; operator must disable extra automations (`COMPETING_CONTROLS.md`).
+### `resume_control` (safe)
 
-**M3 tests:** delayed ack within 25s → no conflict; slow ack → bounded reconcile then `unconfirmed`; injected parallel `climate.set_*` → `external_conflict_paused` without unbounded calls.
+When operator clears `external_conflict_paused` or `unconfirmed_device` (where applicable):
+
+1. Increment intent generation (supersede stale work).
+2. Read **current** physical state and **current** user/virtual settings.
+3. Compute **fresh** physical intent; do **not** replay queued or historical service call list.
+4. Optional: first cycle read-only if D09 startup policy applies.
+
+**M3 tests:** slow ack → `unconfirmed_device` not `external_conflict`; injected second writer → `external_conflict_paused`; resume does not re-send stale 28/18 after user changed setpoints.
 
 ---
 
-## D05 — Canonical Lit card source repository
+## D05 — Canonical card repository and M5 gate
 
-**Proposed resolution:** Keep **canonical frontend source** in `ryanandrewbaker/two-state-thermostat` through M4. This repo ships **integration only** until M5. M5 may vendor a **pinned release artifact** (`two-state-thermostat.js`) under `custom_components/integrated_split_system/frontend/` after install tests. No silent fork of card TypeScript into this repo before approval.
+- Frontend source remains `ryanandrewbaker/two-state-thermostat`.
+- **M5** adds integration mode (§ARCHITECTURE.md §7) with Vitest + HA tests AT-01–AT-18.
+- **M6 production migration is blocked until M5 is complete** (PRD §8–§9).
+- Optional: pin `two-state-thermostat.js` in integration HACS package after install tests (FR-10).
 
 ---
 
 ## D06 — Automatic Lovelace resource registration
 
-**Proposed resolution:** Treat as **unproven** at M0. M5 deliverable: spike using supported `frontend` APIs for the target HA minimum version. Acceptance: fresh HACS install registers resource OR documented one-line manual step with detection of duplicate resources. Failure mode: integration installs without bundling card; user keeps existing HACS Dashboard card.
+Unchanged: prove in M5 or document manual resource URL.
 
 ---
 
 ## D07 — Minimum Home Assistant and Python versions
 
-**Proposed resolution:** Defer numeric pin to **M1**. M1 PR must record operator’s installed HA version, run CI against that version and latest stable, and set `manifest.json` `requirements` / `homeassistant` key accordingly. M0 assumption: Config Entry flows, `ClimateEntity` range targets, config entry diagnostics, and `runtime_data` are required.
+Defer numeric pin to M1.
 
 ---
 
-## D08 — Room-specific temperature sources and thresholds
+## D08 — Room-specific temperature sources
 
-**Proposed resolution:** All per-room variation lives in **config entry data/options**, not code forks. Migration imports Kitchen/Family Room sources from repo audit as **examples only** (not auto-created). Before each room cutover, capture baseline: control temperature formula, targets, boost state, disabled competing automations.
-
-Known examples (repo-confirmed, live unverified):
-
-| Room | Physical (repo) | Control temperature sources (repo) |
-|------|-----------------|--------------------------------------|
-| Kitchen | `climate.kitchen_ac` | `sensor.livingroom_soil_temperature` + `sensor.kitchen_temperature_feels_like` (equal average) |
-| Family Room | `climate.family_room_ac` | `sensor.familyroom_temperature_couch_temperature` + `climate.family_room_ac.current_temperature` (equal average) |
-| Olivia / Alice / Main bedroom | Unknown | Unknown — blocked |
+Unchanged examples table (Kitchen / Family Room confirmed in repo only).
 
 ---
 
 ## D09 — Restart and failure policy
 
-**Proposed resolution:**
-
-1. **On HA start / entry load:** Read physical state; read persisted Boost deadline and snapshot; read compressor/min-cycle timestamps from store.
-2. **First evaluation cycle:** Read-only reconcile — compute desired intent but do not write unless user intent or safety policy requires (e.g. explicit “resume control” after valid Boost restore).
-3. **Boost after restart:** Restore only if deadline not expired and temperature sources valid; else exit Boost safely and log outcome.
-4. **Min-cycle:** Restore deferred hold duration from timestamps like reference `minCycleHoldSecondsFromTimestamps`.
-5. **Never** blindly push 28/18 or user targets on startup solely because virtual entity persisted state differs from physical.
-
-Shadow mode skips step 2 writes entirely.
+Unchanged: read-only first reconcile; Boost restore only if timer valid; no blind physical overwrite.
 
 ---
 
-## D10 — Fan circulation without compressor
+## D10 — Fan without compressor
 
-**Proposed resolution:** Fan Only uses virtual `HVACMode.FAN_ONLY`. Physical mapping uses `resolvePhysicalFanHvacMode` order: `fan`, then `fan_only`. If neither advertised, Fan Only is **unsupported** (repair issue). Min-cycle deferral for start/stop applies to heat/cool; fan/dry paths follow reference exemptions (no deferral when engaging fan-only from off if reference allows). **Per-room proof** required in M2/M4 with live entity state.
+Unchanged: virtual `FAN_ONLY`; physical `fan`/`fan_only`; min-cycle exemptions per reference.
+
+---
+
+## D11 — Native integration API (replaces helper shims) — **GPT-6 blocker**
+
+**Rejected approach:** M4 “companion shims” registering `script`, `input_boolean`, `input_select`, or `timer` inside this integration so the **unchanged** card keeps working. Those domains are not generic platforms for third-party integrations.
+
+**Approved approach:**
+
+| Concern | Mechanism |
+|---------|-----------|
+| Dual setpoints, Off / heat_cool / fan_only | Native virtual `ClimateEntity` |
+| Fan auto + speeds | `climate.set_fan_mode` on virtual climate (M5 card; actuator maps to Sensibo) |
+| Boost start/extend/cancel | `integrated_split_system.boost_start` / `boost_cancel` |
+| Dry | Integration `SwitchEntity` + physical `dry` when supported |
+| Operating state, control temp, humidity, boost countdown | Climate attributes + `SensorEntity` where needed |
+| Conflict resume | `integrated_split_system.resume_control` |
+| Legacy YAML dashboards | Card **legacy mode** — existing helper/script calls |
+
+**M1–M4:** Headless — no working card required. **M5:** Card + AT-* required before **M6**.
+
+Full contract: **ARCHITECTURE.md §7**.
 
 ---
 
 ## Legacy YAML vs intended integration behavior
 
-This table contrasts **observed reference behavior** (card repo TypeScript + docs; Kitchen YAML intended to match) with **intended integration behavior** after approval. Live production YAML version may drift until operator confirms package version ≥ reference actuator v0.6.5+.
-
-| Concern | Legacy YAML / reference observed | Intended integration behavior |
-|---------|-----------------------------------|------------------------------|
-| Installation | Copy package YAML; many helpers | HACS integration + UI config flow |
-| Virtual climate | Dual Smart Thermostat + templates | Native `ClimateEntity` (`heat_cool` + range) |
-| Control temperature | Template sensors, equal average | Python subscriptions, equal average default |
-| Min heat/cool gap | Enforced in package + card | Enforced in `ClimateEntity` set_temperature handlers |
-| Operating state | `sensor.*_auto_operating_state` | Attribute and/or diagnostic entity on virtual climate |
-| Boost | Boolean + timer; no virtual target shift; ±1°C bands; 28/18 physical boost | Same; optional timer restore like Kitchen |
-| Dry | `switch.*_dry_mode` + script | Internal Dry flag; physical `dry` when supported |
-| Fan Only | Virtual climate `fan_only` | Same; gated physical fan mode |
-| Fan manual/auto | Helpers + `mapSelectedFanToSensibo` | Options + same mapping table in Python |
-| Physical commands | `script.*_actuator_apply` automation | Serialized actuator service calls |
-| Intent coalescing | `input_number.*_actuator_intent` + restart mode | Single asyncio owner / intent generation counter |
-| Min cycle 300s | Timer + deferred action select | Persisted timestamps + scheduled reconcile |
-| User off | Bypass deferred shutdown | Same bypass rule |
-| Competing writers | Operator disabled Kitchen legacy automation | Detection + warning; operator must disable extras |
-| Card integration | Card calls climate + helpers (see ARCHITECTURE §7) | Phase 1: **companion shims** + attributes; Phase 2 (M5): native card services |
-| Diagnostics | Debug log prefix, command counter helpers | Native diagnostics + optional entities |
-| Shadow / migration | Manual comparison | Built-in shadow mode on config entry |
-| Multi-room | Separate YAML per room | Multiple config entries, shared code |
-| Sensibo credentials | Via existing integration | Unchanged; no new tokens |
+| Concern | Legacy YAML / card today | Integration + M5 card |
+|---------|--------------------------|------------------------|
+| Boost UI | `script.*_climate_boost` | `integrated_split_system.boost_start` |
+| Fan auto/speed | `input_boolean` / `input_select` | `climate.set_fan_mode` on virtual climate |
+| Dry | `switch.*_dry_mode` (YAML) | `switch.*_iss_dry_mode` (integration) |
+| Operating state | Template sensor | `operating_state` attribute + sensor |
+| Physical writes | Package actuator script | Integration actuator only |
+| Card detection | `two_state_thermostat` | + `integrated_split_system: true` |
 
 ---
 
-## Card compatibility decision (M0, addresses GPT-6 blocker #2)
+## Open questions for reviewers
 
-**Problem:** `custom:two-state-thermostat` calls helper domains (`src/services.ts`, `ALLOWED_SERVICE_DOMAINS`). Attributes alone are insufficient.
-
-**Proposed transition:**
-
-| Phase | Card | Integration |
-|-------|------|-------------|
-| M1–M4 | **Unchanged** (`two-state-thermostat` repo) | Exposes native `ClimateEntity` **plus** companion entities/services matching attribute IDs (`boost_script_entity`, `fan_auto_entity`, …) |
-| M5+ | Optional: detect `integrated_split_system` and call integration services | May slim shims after card update |
-
-Full per-control contract: **ARCHITECTURE.md §7**. Card parity is **not claimed** until M4/M5 acceptance tests pass.
-
----
-
-## Open questions for reviewers (M0 re-review)
-
-1. Approve **D01** canonical backend (= Kitchen package, no ±2°C virtual shift)?
-2. Approve **D04** phase model and constants (25s ACK grace, bounded reconcile, external pause)?
-3. Approve **companion shim** strategy for unchanged card through M4?
-4. Freeze HA domain **`integrated_split_system`** (see `docs/NAMING.md`)?
+1. Approve **D01** Kitchen-equivalent Boost backend?
+2. Approve **D04** three-way failure model + safe `resume_control`?
+3. Approve **D11** (no shims; M5 mandatory before M6)?
+4. Freeze domain **`integrated_split_system`**?
 
 ---
 
@@ -222,5 +247,7 @@ Full per-control contract: **ARCHITECTURE.md §7**. Card parity is **not claimed
 
 | Date | ID | Outcome |
 |------|-----|---------|
-| 2026-10-24 | D01–D10 | Initial M0 proposal |
-| 2026-10-24 | D01, D04, card contract | Revised per GPT-6 PR #1 review — pending re-review |
+| 2026-10-24 | D01–D10 | Initial + first GPT-6 revision (merged PR #1) |
+| 2026-10-24 | D11, §7 contract | Native API; drop M4 shims — pending GPT-6 review |
+| 2026-10-24 | FR-05/FR-08, §7.2 services | Boost persistence + entity-targeted service payloads (GPT-6 PR #2 follow-up) |
+| 2026-10-24 | FR-01, D02 | Equipment profiles + Sensibo Air/Sky; capability discovery (GPT-6 PR #2 final amendment) |

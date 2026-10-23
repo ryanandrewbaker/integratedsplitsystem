@@ -1,0 +1,75 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Integrated Split System room",
+        "description": "Bind a physical climate entity to a virtual room thermostat.",
+        "data": {
+          "room_name": "Room name",
+          "physical_climate_entity_id": "Physical climate entity",
+          "profile_id": "Connected AC equipment profile",
+          "sensibo_controller_type": "Sensibo controller type"
+        }
+      },
+      "profile": {
+        "title": "Create equipment profile",
+        "description": "Profiles are reusable across rooms; each room keeps independent runtime state.",
+        "data": {
+          "profile_name": "Profile name",
+          "profile_id": "Profile id (optional)"
+        }
+      }
+    },
+    "error": {
+      "physical_climate_invalid": "Select a valid climate entity.",
+      "profile_invalid": "Select an existing profile or create a new one.",
+      "required": "This field is required.",
+      "invalid": "Invalid profile id (use lowercase letters, numbers, underscores).",
+      "already_exists": "A profile with this id already exists."
+    },
+    "abort": {
+      "physical_climate_in_use": "That physical climate is already configured for another room."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Integrated Split System options",
+        "data": {
+          "profile_id": "Connected AC equipment profile",
+          "sensibo_controller_type": "Sensibo controller type"
+        }
+      },
+      "profile": {
+        "title": "Create equipment profile",
+        "data": {
+          "profile_name": "Profile name",
+          "profile_id": "Profile id (optional)"
+        }
+      }
+    },
+    "error": {
+      "profile_invalid": "Select an existing profile or create a new one.",
+      "required": "This field is required.",
+      "invalid": "Invalid profile id (use lowercase letters, numbers, underscores).",
+      "already_exists": "A profile with this id already exists."
+    }
+  },
+  "exceptions": {
+    "unsupported_hvac_mode": {
+      "message": "HVAC mode {mode} is not supported on this virtual thermostat."
+    },
+    "invalid_temperature": {
+      "message": "Temperature must be a finite number."
+    },
+    "temp_out_of_range": {
+      "message": "Temperature is outside the allowed range for this room."
+    },
+    "temp_separation_too_small": {
+      "message": "Heating and cooling targets must be at least 2 °C apart."
+    },
+    "low_temp_higher_than_high_temp": {
+      "message": "The heating target cannot be higher than the cooling target."
+    }
+  }
+}
