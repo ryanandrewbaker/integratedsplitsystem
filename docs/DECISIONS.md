@@ -1,9 +1,9 @@
 # Design decisions — Integrated Split System (M0)
 
-**Status:** Proposed resolutions for review. Not approved for implementation until the M0 PR is accepted.  
-**Date:** 24 October 2026
+**Status:** Revised per GPT-6 review on PR #1 (24 Oct 2026). Pending re-review.  
+**Behavioural reference:** `ryanandrewbaker/two-state-thermostat` — `homeassistant/packages/kitchen_auto_climate.yaml`, `homeassistant/lib/kitchen-climate-*.ts`, `src/services.ts`, `src/state.ts`, `src/constants.ts`.
 
-Decisions D01–D10 correspond to PRD §11. Each entry lists the question, **proposed resolution**, evidence, and **residual risk / owner action**.
+Decisions D01–D10 correspond to PRD §11.
 
 ---
 
@@ -11,10 +11,10 @@ Decisions D01–D10 correspond to PRD §11. Each entry lists the question, **pro
 
 | ID | Topic | Proposed resolution (M0) | Gate to finalize |
 |----|--------|---------------------------|------------------|
-| D01 | Boost semantics | Three-layer model: card ±2°C user semantics; reference band narrowing + hysteresis for control; physical mapping configurable with **migration default = reference actuator** | User approves table below |
+| D01 | Boost semantics | **Single canonical backend model** = Kitchen package + TS (no ±2°C virtual setpoint shift); card ±2°C arc is display-only | User approves golden examples |
 | D02 | Physical hvac/fan modes | Probe at setup from underlying entity; hide/disable unsupported features | Live HA export before M4/M6 |
 | D03 | Unverified rooms | No config presets; entries only via UI after operator inventory | Export before each room migration |
-| D04 | External physical writes | Observe, warn, pause reconciliation; no infinite fight | M3 actuator design |
+| D04 | External physical writes | **pending_ack** vs **external_conflict_paused** (see §D04); bounded reconcile from Kitchen YAML | M3 actuator tests |
 | D05 | Card source repo | Keep canonical source in `two-state-thermostat` until M5 | M5 packaging |
 | D06 | Auto frontend resource | Attempt in M5; document manual fallback | M5 install tests |
 | D07 | HA/Python minimum | Choose in M1 from operator HA version + CI matrix | M1 |
@@ -24,32 +24,44 @@ Decisions D01–D10 correspond to PRD §11. Each entry lists the question, **pro
 
 ---
 
-## D01 — Boost semantics (card vs controller vs physical)
+## D01 — Boost semantics (canonical v1 model)
 
-**Conflict:** Card README documents a **±2°C** shift on the active heating/cooling target, 30-minute timer, snapshot restore, and High fan lock. Reference TypeScript also narrows control bands by **±1°C** when `manualBoost` is true (`baseLow + 1` / `baseHigh - 1`). Reference actuator commands **fixed** physical targets in boost: **28°C heat**, **18°C cool**, while maintain uses `low + 1` / `high - 1` clamped.
+**GPT-6 blocker addressed:** Do not stack card ±2°C virtual setpoint changes on top of Kitchen ±1°C control bands and 28/18 physical boost targets.
 
-**Proposed resolution:**
+### What the reference system actually does
 
-1. **User-visible Boost (card parity):** Implement exactly as card README §Boost: ±2°C on the active direction’s setpoint for display and virtual target bookkeeping; 30-minute timer; snapshot of heat/cool targets + fan auto/manual + manual fan selection; extend restarts timer without compounding; cancel/expiry/setpoint change restores snapshot; High fan forced while Boost active.
-2. **Control demand (state machine):** Port `computeKitchenClimateController` hysteresis and band logic, including `manualBoost` band adjustment and transition thresholds (1.0°C / 1.5°C), as the default controller profile named `kitchen_reference`.
-3. **Physical mapping (actuator):** Default profile `kitchen_reference` uses `computePhysicalIntent` rules (boost → 28/18, maintain → offset targets). Add options flow key `physical_boost_strategy`: `reference_fixed` (default for migration) | `virtual_offset` (map from virtual boosted setpoints) for future tuning without card changes.
+| Layer | Observed behaviour (Kitchen package + card TS) | Source |
+|-------|--------------------------------------------------|--------|
+| Boost start script | If virtual climate not `off`: `input_boolean.kitchen_climate_boost` **on** + `timer.kitchen_climate_boost` **30:00** | `script.kitchen_climate_boost` |
+| Virtual heat/cool targets | **Unchanged** on `climate.kitchen_auto_climate` during Boost | Package + card `set_temperature` only on user dial edits |
+| Manual boost flag | Drives `manual_boost` in controller + actuator (`input_boolean.kitchen_climate_boost`) | Actuator variables |
+| Control band adjustment | When `manual_boost` and direction **heat**: effective low = `base_low + 1.0`; when **cool**: effective high = `base_high - 1.0` | YAML templates, `computeKitchenClimateController` |
+| Effective target sensors | Same ±1°C on active direction for display helpers | `sensor.kitchen_effective_*_target` templates |
+| Physical boost targets | When `controller_state == boost`: heat → **28°C**, cool → **18°C** | `computePhysicalIntent`, `kitchen_actuator_apply` |
+| Physical maintain targets | heat → `min(low + 1, 30)`, cool → `max(high - 1, 10)` with boosted `low`/`high` | Same |
+| Cancel / expiry | `kitchen_climate_cancel_boost` and boost lifecycle: timer cancel + boolean **off** — **no** separate snapshot helpers in Kitchen YAML | Scripts + `kitchen_auto_climate_boost_lifecycle` |
+| Card dial arc | **±2°C** overlay only (`DEFAULT_BOOST_TEMPERATURE_OFFSET = 2` in `getBoostArcOverlay`) | `src/constants.ts`, `src/state.ts` — **does not** change climate attributes |
+| Card README “±2°C / snapshot” | Documents UX intent; Kitchen YAML does **not** shift virtual setpoints ±2°C or restore a multi-field snapshot on cancel | Treat README as **card UX spec**; backend parity = package |
 
-**Approval needed:** Confirm migration default `reference_fixed` for Kitchen/Family Room pilot.
+**Canonical v1 integration model (proposed):** Port the **Kitchen backend** exactly: boolean + timer, ±1°C band narrowing when manual boost active, state machine + 28/18 physical boost, high fan staging while manual boost and boost/maintain. Do **not** mutate virtual `target_temp_low`/`target_temp_high` when Boost starts.
 
-### Boost behavior layers (reference vs intended)
+**Intentional non-parity (documented):** Card boost arc uses **2°C**; backend effective targets use **1°C**. Keeping the unchanged card is acceptable for M4; aligning arc to 1°C is an optional **M5 card** change, not an integration change.
 
-| Layer | Documented / card intended | Reference TS/YAML observed | Integration intended (if approved) |
-|-------|---------------------------|----------------------------|-----------------------------------|
-| Timer duration | 30 minutes | 30 minutes (YAML timer) | 30 minutes configurable default |
-| Extend Boost | Restart timer; keep snapshot; no compound offset | Same (package scripts) | Same |
-| Cancel Boost | Restore snapshot | Same | Same |
-| Setpoint change while Boost | Cancels Boost | Package behavior | Same |
-| Active arc visual | ±2°C past live setpoint | Card UI | Card unchanged |
-| Virtual target shift | ±2°C active direction | Band narrowing ±1°C in state machine only | Both: card shift for entity targets; state machine uses reference bands |
-| Physical boost heat target | Not specified in card | 28°C when `controllerState === boost` | Default `reference_fixed` → 28°C |
-| Physical boost cool target | Not specified in card | 18°C when boost cool | Default `reference_fixed` → 18°C |
-| Physical maintain targets | Not user-visible | `min(low+1,30)` / `max(high-1,10)` | Same under default profile |
-| Fan during Boost | High; lock auto/speed on card | High + `applyAutomaticFanStage` | High; match card lock semantics |
+### Golden Boost examples (Kitchen reference, targets 20.0 / 24.5 °C heat/cool)
+
+Assumptions: climate on `heat_cool`, direction **heat**, control temp drives controller state, fan automatic unless noted.
+
+| ID | Scenario | User action | Virtual targets | `manual_boost` | Band used (heat) | Controller → physical (when applicable) |
+|----|----------|-------------|-----------------|----------------|------------------|----------------------------------------|
+| B1 | Start Boost (idle/maintain) | Card → `script.turn_on` boost | 20.0 / 24.5 unchanged | on, timer 30m | low **21.0** (20+1) | If state → `boost`: physical heat **28°C** + high fan |
+| B2 | Extend Boost | Card → boost again (timer restart) | unchanged | stays on, timer reset | unchanged | No compounding: boolean was already on; timer only restarts |
+| B3 | Cancel Boost | Card → cancel script | unchanged | off, timer cancelled | low **20.0** | Reconcile toward maintain/idle intent; no “undo math” on targets |
+| B4 | Timer expiry | Timer finished → lifecycle | unchanged | off | back to base | Same as B3 |
+| B5 | Setpoint edit while Boost | Card → `cancelBoost` then `climate.set_temperature` | user new values | off after cancel | per new targets | Card already cancels Boost first (`two-state-thermostat.ts`) |
+| B6 | Boost while cooling | Boost on, direction **cool** | unchanged | on | high **23.5** (24.5−1) | If `boost` cool: physical **18°C** |
+| B7 | HA restart | Timer `restore: true` | unchanged | lifecycle clears boolean if timer not active | — | On startup: do not force physical 28/18 until controller evaluates (see D09) |
+
+**User approval:** Confirm canonical v1 = Kitchen backend (not card README ±2°C virtual shift).
 
 ---
 
@@ -67,15 +79,38 @@ Decisions D01–D10 correspond to PRD §11. Each entry lists the question, **pro
 
 ---
 
-## D04 — External physical change vs controller intent
+## D04 — Physical acknowledgement delay vs external conflict
 
-**Proposed resolution:** **Warn and pause**, do not auto-retaliate indefinitely.
+**GPT-6 blocker addressed:** Slow Sensibo updates are not competing writers. Policy must separate **pending acknowledgement** from **external conflict**.
 
-- On unexpected physical state change while converged: increment mismatch counter, set controller flag `external_divergence`, surface repair/warning with last known intent vs observed state.
-- Reconciliation pauses until user clears issue, underlying entity returns to expected state, or user explicitly resumes (options or service).
-- Do not implement “always reclaim immediately” as default (avoids beeping wars; aligns with PRD FR-07 and Kitchen competing-control incident).
+### Reference behaviour (Kitchen actuator)
 
-Alternative `aggressive_reclaim` deferred; not recommended for v1.
+- Each apply run compares desired vs actual mode, target (±0.1°C), and fan (`evaluateFanConfirmation` / YAML equivalent). If not converged, issues minimal `climate.*` calls once per run.
+- `input_number.kitchen_actuator_intent` increments; stale script runs exit when `run_intent != current intent`.
+- Mismatch automations re-trigger apply after **60s** (active heat/cool) or **90s** (idle/fan/dry expected off) sustained divergence.
+- Reconcile path **throttles** if `kitchen_ac_last_apply` was **&lt; 25s** ago (`stop=reconcile_throttled` — physical may still be converging).
+
+### Integration actuator phases (proposed)
+
+| Phase | Meaning | Physical writes | User-visible |
+|-------|---------|-----------------|--------------|
+| `converged` | Desired matches reported within tolerance | None | Normal |
+| `pending_ack` | We issued a command; waiting for physical state | None additional until grace elapses | Optional “syncing” diagnostic |
+| `reconciling` | Not converged after grace; bounded apply retries | At most one apply burst per throttle window | Diagnostics show attempt count |
+| `unconfirmed` | Fan/target still wrong after max attempts per intent | **Stop** retrying this intent | Repair: fan not confirmed |
+| `external_conflict_paused` | Sustained mismatch **not** explained by our last command + grace; pattern consistent with second writer or manual AC UI | **Paused** until cleared | Repair issue + log |
+
+### Rules
+
+1. **ACK grace window:** After any physical service call, enter `pending_ack` for **`ACK_GRACE_SECONDS = 25`** (match Kitchen reconcile throttle). Physical changes in this window **do not** set external conflict.
+2. **Convergence tolerance:** Mode match rules + **0.1°C** target + fan rules from `kitchen-climate-yaml-templates.ts` (manual high ≠ satisfied by `auto` alone).
+3. **Bounded reconcile:** While not converged and not paused, retry at most **`MAX_RECONCILE_BURST = 3`** apply cycles per mismatch episode, respecting 25s throttle (extends Kitchen counter `kitchen_ac_reconcile_attempts` concept).
+4. **External conflict detection:** If mismatch persists **> 60s** (active) or **> 90s** (idle path) **and** grace/reconcile bursts exhausted **and** observed physical state does not match last **integration-issued** command fingerprint → `external_conflict_paused`. Do not issue further physical commands (prevents Kitchen-style beeping wars).
+5. **Legitimate manual override:** User changes AC from Sensibo app/remote → treated as external conflict once sustained; virtual climate and card keep showing **requested** state; diagnostics show observed vs requested.
+6. **While paused:** Virtual controller continues to compute demand for UI; **no** physical heat/cool/fan/dry commands until user **Resume control** (options/service) after resolving competing automation or accepting observed state.
+7. **Competing HA writer:** Same as manual override; operator must disable extra automations (`COMPETING_CONTROLS.md`).
+
+**M3 tests:** delayed ack within 25s → no conflict; slow ack → bounded reconcile then `unconfirmed`; injected parallel `climate.set_*` → `external_conflict_paused` without unbounded calls.
 
 ---
 
@@ -142,7 +177,7 @@ This table contrasts **observed reference behavior** (card repo TypeScript + doc
 | Control temperature | Template sensors, equal average | Python subscriptions, equal average default |
 | Min heat/cool gap | Enforced in package + card | Enforced in `ClimateEntity` set_temperature handlers |
 | Operating state | `sensor.*_auto_operating_state` | Attribute and/or diagnostic entity on virtual climate |
-| Boost | Scripts, timer, input_boolean | Internal state + persisted snapshot/deadline |
+| Boost | Boolean + timer; no virtual target shift; ±1°C bands; 28/18 physical boost | Same; optional timer restore like Kitchen |
 | Dry | `switch.*_dry_mode` + script | Internal Dry flag; physical `dry` when supported |
 | Fan Only | Virtual climate `fan_only` | Same; gated physical fan mode |
 | Fan manual/auto | Helpers + `mapSelectedFanToSensibo` | Options + same mapping table in Python |
@@ -151,7 +186,7 @@ This table contrasts **observed reference behavior** (card repo TypeScript + doc
 | Min cycle 300s | Timer + deferred action select | Persisted timestamps + scheduled reconcile |
 | User off | Bypass deferred shutdown | Same bypass rule |
 | Competing writers | Operator disabled Kitchen legacy automation | Detection + warning; operator must disable extras |
-| Card integration | Many entity attributes on virtual climate | Phase 1: compatible attributes; Phase 2: slim surface |
+| Card integration | Card calls climate + helpers (see ARCHITECTURE §7) | Phase 1: **companion shims** + attributes; Phase 2 (M5): native card services |
 | Diagnostics | Debug log prefix, command counter helpers | Native diagnostics + optional entities |
 | Shadow / migration | Manual comparison | Built-in shadow mode on config entry |
 | Multi-room | Separate YAML per room | Multiple config entries, shared code |
@@ -159,11 +194,27 @@ This table contrasts **observed reference behavior** (card repo TypeScript + doc
 
 ---
 
-## Open questions for reviewers (M0)
+## Card compatibility decision (M0, addresses GPT-6 blocker #2)
 
-1. Approve **D01** migration default `physical_boost_strategy = reference_fixed` (28/18 boost targets)?
-2. Approve **D04** “warn and pause” as the only default for external divergence?
-3. Freeze HA domain **`integrated_split_system`** before any config entry is created in the wild (see `docs/NAMING.md`)?
+**Problem:** `custom:two-state-thermostat` calls helper domains (`src/services.ts`, `ALLOWED_SERVICE_DOMAINS`). Attributes alone are insufficient.
+
+**Proposed transition:**
+
+| Phase | Card | Integration |
+|-------|------|-------------|
+| M1–M4 | **Unchanged** (`two-state-thermostat` repo) | Exposes native `ClimateEntity` **plus** companion entities/services matching attribute IDs (`boost_script_entity`, `fan_auto_entity`, …) |
+| M5+ | Optional: detect `integrated_split_system` and call integration services | May slim shims after card update |
+
+Full per-control contract: **ARCHITECTURE.md §7**. Card parity is **not claimed** until M4/M5 acceptance tests pass.
+
+---
+
+## Open questions for reviewers (M0 re-review)
+
+1. Approve **D01** canonical backend (= Kitchen package, no ±2°C virtual shift)?
+2. Approve **D04** phase model and constants (25s ACK grace, bounded reconcile, external pause)?
+3. Approve **companion shim** strategy for unchanged card through M4?
+4. Freeze HA domain **`integrated_split_system`** (see `docs/NAMING.md`)?
 
 ---
 
@@ -171,4 +222,5 @@ This table contrasts **observed reference behavior** (card repo TypeScript + doc
 
 | Date | ID | Outcome |
 |------|-----|---------|
-| 2026-10-24 | D01–D10 | Proposed in M0 PR — pending user / GPT-6 approval |
+| 2026-10-24 | D01–D10 | Initial M0 proposal |
+| 2026-10-24 | D01, D04, card contract | Revised per GPT-6 PR #1 review — pending re-review |
