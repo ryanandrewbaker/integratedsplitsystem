@@ -8,6 +8,8 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 
 from .const import DEFAULT_PROFILE_ID, DOMAIN, STORAGE_PROFILES_KEY, STORAGE_PROFILES_VERSION
+from .entry_helpers import get_profile_id
+from .util import is_valid_profile_id
 
 _GENERIC_PROFILE: dict[str, Any] = {
     "id": DEFAULT_PROFILE_ID,
@@ -49,26 +51,27 @@ class EquipmentProfileStore:
         return list(self._profiles.values())
 
     async def async_create_profile(self, profile_id: str, name: str) -> dict[str, Any]:
+        if not is_valid_profile_id(profile_id):
+            raise ValueError(f"Invalid profile id: {profile_id}")
         profile = {"id": profile_id, "name": name, "shared": True}
         self._profiles[profile_id] = profile
         await self._persist()
         return profile
 
-    async def async_delete_profile(self, profile_id: str) -> bool:
+    async def async_delete_profile(self, hass: HomeAssistant, profile_id: str) -> bool:
         if profile_id == DEFAULT_PROFILE_ID:
             return False
         if profile_id not in self._profiles:
+            return False
+        if profile_id in self.profiles_in_use(hass):
             return False
         del self._profiles[profile_id]
         await self._persist()
         return True
 
     def profiles_in_use(self, hass: HomeAssistant) -> set[str]:
-        """Profile IDs referenced by any config entry."""
+        """Profile IDs referenced by any config entry (data or options)."""
         in_use: set[str] = set()
-        from .const import CONF_PROFILE_ID  # local import avoids circular
-
         for entry in hass.config_entries.async_entries(DOMAIN):
-            pid = entry.data.get(CONF_PROFILE_ID, DEFAULT_PROFILE_ID)
-            in_use.add(pid)
+            in_use.add(get_profile_id(entry))
         return in_use

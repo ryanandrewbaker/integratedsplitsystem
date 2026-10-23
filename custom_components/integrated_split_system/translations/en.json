@@ -10,10 +10,22 @@
           "profile_id": "Connected AC equipment profile",
           "sensibo_controller_type": "Sensibo controller type"
         }
+      },
+      "profile": {
+        "title": "Create equipment profile",
+        "description": "Profiles are reusable across rooms; each room keeps independent runtime state.",
+        "data": {
+          "profile_name": "Profile name",
+          "profile_id": "Profile id (optional)"
+        }
       }
     },
     "error": {
-      "physical_climate_invalid": "Select a valid climate entity."
+      "physical_climate_invalid": "Select a valid climate entity.",
+      "profile_invalid": "Select an existing profile or create a new one.",
+      "required": "This field is required.",
+      "invalid": "Invalid profile id (use lowercase letters, numbers, underscores).",
+      "already_exists": "A profile with this id already exists."
     },
     "abort": {
       "physical_climate_in_use": "That physical climate is already configured for another room."
@@ -27,7 +39,25 @@
           "profile_id": "Connected AC equipment profile",
           "sensibo_controller_type": "Sensibo controller type"
         }
+      },
+      "profile": {
+        "title": "Create equipment profile",
+        "data": {
+          "profile_name": "Profile name",
+          "profile_id": "Profile id (optional)"
+        }
       }
+    },
+    "error": {
+      "profile_invalid": "Select an existing profile or create a new one.",
+      "required": "This field is required.",
+      "invalid": "Invalid profile id (use lowercase letters, numbers, underscores).",
+      "already_exists": "A profile with this id already exists."
+    }
+  },
+  "exceptions": {
+    "unsupported_hvac_mode": {
+      "message": "HVAC mode {mode} is not supported on this virtual thermostat."
     }
   }
 }

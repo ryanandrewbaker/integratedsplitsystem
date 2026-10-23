@@ -7,15 +7,10 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import (
-    CONF_PHYSICAL_CLIMATE_ENTITY_ID,
-    CONF_PROFILE_ID,
-    DEFAULT_PROFILE_ID,
-    DOMAIN,
-    PLATFORMS,
-)
+from .const import CONF_PHYSICAL_CLIMATE_ENTITY_ID, DOMAIN, PLATFORMS
 from .coordinator import IntegratedSplitSystemCoordinator
 from .data import IntegratedSplitSystemRuntimeData
+from .entry_helpers import get_profile_id
 from .equipment_profile import EquipmentProfileStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -52,10 +47,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await async_setup(hass, {})
 
-    profile_id = entry.data.get(CONF_PROFILE_ID, DEFAULT_PROFILE_ID)
+    profile_id = get_profile_id(entry)
     store: EquipmentProfileStore = hass.data[DOMAIN]["profiles"]
     if store.get_profile(profile_id) is None:
-        await store.async_create_profile(profile_id, profile_id.replace("_", " ").title())
+        _LOGGER.error(
+            "Unknown equipment profile %s for entry %s; create profiles via config/options UI",
+            profile_id,
+            entry.entry_id,
+        )
+        return False
 
     coordinator = IntegratedSplitSystemCoordinator(hass, entry)
     entry.runtime_data = IntegratedSplitSystemRuntimeData(coordinator=coordinator)

@@ -130,6 +130,16 @@ async def setup_config_entry(
     title: str | None = None,
 ) -> ConfigEntry:
     """Add a MockConfigEntry and run integration setup."""
+    from custom_components.integrated_split_system import async_setup as domain_setup
+
+    await domain_setup(hass, {})
+    store = hass.data[DOMAIN]["profiles"]
+    profile_id = data.get(CONF_PROFILE_ID, DEFAULT_PROFILE_ID)
+    if profile_id != DEFAULT_PROFILE_ID and store.get_profile(profile_id) is None:
+        await store.async_create_profile(
+            profile_id, profile_id.replace("_", " ").title()
+        )
+
     entry = MockConfigEntry(
         domain=DOMAIN,
         data=data,

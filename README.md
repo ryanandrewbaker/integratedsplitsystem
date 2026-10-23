@@ -14,7 +14,7 @@ An upcoming native Home Assistant custom integration that wraps an existing phys
 
 Milestone **M1** adds an installable `custom_components/integrated_split_system` package (config/options flow, virtual `ClimateEntity`, equipment profiles). **M1 does not send physical climate commands.** See [M1 version pins](docs/M1_VERSIONS.md). Architecture uses a **native integration API** and an **M5 card update** (no `script`/`input_*` shims). **M5 is required before any production room migration (M6).** Do not deploy to production HA from this repo without explicit approval.
 
-**Dev tests:** `pip install -r requirements-dev.txt && pytest tests/`
+**Dev tests (Python 3.14.2+):** `pip install -r requirements-dev.txt && python -m pytest tests/`
 
 Proposed repository: `ryanandrewbaker/integratedsplitsystem`.
 
